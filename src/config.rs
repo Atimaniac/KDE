@@ -22,6 +22,8 @@ pub struct Config {
     pub sort: SortBy,
     pub sort_asc: bool,
     pub folders_first: bool,
+    /// Shell: hide minimized windows into the tray.
+    pub minimize_to_tray: bool,
     /// User-added entries in the Places panel.
     pub places: Vec<PathBuf>,
 }
@@ -38,6 +40,7 @@ impl Default for Config {
             sort: SortBy::Name,
             sort_asc: true,
             folders_first: true,
+            minimize_to_tray: false,
             places: Vec::new(),
         }
     }
@@ -78,6 +81,7 @@ impl Config {
                 "dark" => c.dark = v == "1",
                 "folders_first" => c.folders_first = v == "1",
                 "sort_asc" => c.sort_asc = v == "1",
+                "minimize_to_tray" => c.minimize_to_tray = v == "1",
                 "sort" => {
                     c.sort = match v {
                         "size" => SortBy::Size,
@@ -112,6 +116,7 @@ impl Config {
         s += &format!("dark={}\n", b(self.dark));
         s += &format!("folders_first={}\n", b(self.folders_first));
         s += &format!("sort_asc={}\n", b(self.sort_asc));
+        s += &format!("minimize_to_tray={}\n", b(self.minimize_to_tray));
         s += &format!(
             "sort={}\n",
             match self.sort {

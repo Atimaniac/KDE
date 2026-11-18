@@ -10,6 +10,7 @@
 pub mod install;
 mod startmenu;
 mod startup;
+mod tray;
 mod win;
 
 use crate::config::Config;
@@ -26,12 +27,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
+use tray::{Click, TrayIcon};
 
 const PANEL_H: f32 = 44.0;
 const LAUNCHER_W: f32 = 480.0;
 const LAUNCHER_H: f32 = 580.0;
 const PANEL_TITLE: &str = "Delfin Panel";
 const DESKTOP_TITLE: &str = "Delfin Desktop";
+/// Tray icons shown directly on the panel; the rest go behind the ^ button.
+const TRAY_INLINE: usize = 8;
+const BALLOON_SECS: u64 = 7;
 
 pub fn run() -> Result<(), eframe::Error> {
     if !win::single_instance("Local\\DelfinShell") {
@@ -81,6 +86,9 @@ enum PanelAction {
     Terminal,
     ShowDesktop,
     Uri(&'static str),
+    Tray(isize, u32, Click, f32),
+    Unshelve(isize),
+    ToggleOverflow,
 }
 
 enum DeskAction {
@@ -118,9 +126,42 @@ struct ShellApp {
     wallpaper_path: Option<PathBuf>,
     wallpaper_checked: Option<Instant>,
     shell_window_set: bool,
+    // tray
+    tray: Option<tray::Shared>,
+    tray_tex: HashMap<(isize, u32), (u64, TextureHandle)>,
+    overflow_open: bool,
+    overflow_seen_focus: bool,
+    overflow_closed_at: Instant,
+    last_hover: Option<(isize, u32)>,
+    tip: Option<(String, f32, Instant)>,
+    balloon_since: Option<Instant>,
+    /// Windows hidden by "minimize to tray".
+    shelved: Vec<isize>,
     // shared
     textures: HashMap<String, Option<TextureHandle>>,
     hotkeys: Receiver<win::Hotkey>,
+}
+
+/// Remember shelved windows on disk so they can be shown again if the shell
+/// is restarted (a hidden window would otherwise stay invisible).
+fn shelved_file() -> PathBuf {
+    std::env::temp_dir().join("delfin-shelved.txt")
+}
+
+fn save_shelved(list: &[isize]) {
+    let text: Vec<String> = list.iter().map(|h| h.to_string()).collect();
+    let _ = std::fs::write(shelved_file(), text.join("\n"));
+}
+
+fn restore_leftover_shelved() {
+    if let Ok(text) = std::fs::read_to_string(shelved_file()) {
+        for h in text.lines().filter_map(|l| l.trim().parse::<isize>().ok()) {
+            if win::is_window(h) {
+                win::unhide(h);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(shelved_file());
 }
 
 impl ShellApp {
@@ -131,6 +172,16 @@ impl ShellApp {
 
         let (tx, rx) = channel();
         win::spawn_hotkeys(tx, cc.egui_ctx.clone());
+        restore_leftover_shelved();
+
+        // Tray host must exist before startup apps run, otherwise they decide
+        // there is no taskbar and don't create their icons. Skip it if
+        // Explorer's tray is running (test mode with explorer.exe alive).
+        let tray = if win::find_class("Shell_TrayWnd").is_none() {
+            Some(tray::start(cc.egui_ctx.clone()))
+        } else {
+            None
+        };
 
         // Only when we really are the shell, and only once per sign-in.
         if install::shell_installed() && win::first_shell_start_this_session() {
@@ -164,6 +215,15 @@ impl ShellApp {
             wallpaper_path: None,
             wallpaper_checked: None,
             shell_window_set: false,
+            tray,
+            tray_tex: HashMap::new(),
+            overflow_open: false,
+            overflow_seen_focus: false,
+            overflow_closed_at: long_ago,
+            last_hover: None,
+            tip: None,
+            balloon_since: None,
+            shelved: Vec::new(),
             textures: HashMap::new(),
             hotkeys: rx,
         };
@@ -207,6 +267,99 @@ impl ShellApp {
         });
         self.textures.insert(key, t.clone());
         t
+    }
+
+    fn tray_icons(&self) -> Vec<TrayIcon> {
+        match &self.tray {
+            Some(t) => {
+                let st = t.lock().unwrap_or_else(|p| p.into_inner());
+                st.icons.iter().filter(|i| !i.hidden).cloned().collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn tray_texture(&mut self, ctx: &egui::Context, ic: &TrayIcon) -> Option<TextureHandle> {
+        let (w, h, px) = ic.icon.as_ref()?;
+        let key = (ic.hwnd, ic.uid);
+        let image = || egui::ColorImage::from_rgba_unmultiplied([*w, *h], &px[..]);
+        if let Some((gen, tex)) = self.tray_tex.get_mut(&key) {
+            if *gen != ic.icon_gen {
+                tex.set(image(), egui::TextureOptions::LINEAR);
+                *gen = ic.icon_gen;
+            }
+            return Some(tex.clone());
+        }
+        let tex = ctx.load_texture(
+            format!("tray:{}:{}", key.0, key.1),
+            image(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.tray_tex.insert(key, (ic.icon_gen, tex.clone()));
+        Some(tex)
+    }
+
+    /// Screen position (physical px) that programs expect as the click anchor.
+    fn anchor_px(ctx: &egui::Context, x_points: f32) -> (i32, i32) {
+        let ppp = ctx.pixels_per_point();
+        let (_, h_px) = win::screen_px();
+        (
+            (x_points * ppp) as i32,
+            h_px - (PANEL_H * ppp).round() as i32,
+        )
+    }
+
+    fn send_tray_click(&mut self, ctx: &egui::Context, hwnd: isize, uid: u32, kind: Click, x: f32) {
+        let icons = self.tray_icons();
+        if let Some(ic) = icons.iter().find(|i| i.hwnd == hwnd && i.uid == uid) {
+            tray::click(ic, kind, Self::anchor_px(ctx, x));
+        }
+    }
+
+    fn unshelve(&mut self, h: isize) {
+        win::unhide(h);
+        self.shelved.retain(|x| *x != h);
+        save_shelved(&self.shelved);
+    }
+
+    fn unshelve_all(&mut self) {
+        for h in std::mem::take(&mut self.shelved) {
+            win::unhide(h);
+        }
+        save_shelved(&self.shelved);
+    }
+
+    /// One tray-sized icon button.
+    fn tray_slot(
+        ui: &mut Ui,
+        tex: Option<&TextureHandle>,
+        underline: bool,
+        pal: &Palette,
+    ) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 36.0), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 4.0, pal.hover);
+        }
+        let ir = Rect::from_center_size(rect.center(), vec2(18.0, 18.0));
+        match tex {
+            Some(t) => {
+                ui.painter().image(t.id(), ir, uv_full(), Color32::WHITE);
+            }
+            None => {
+                ui.painter()
+                    .rect_stroke(ir.shrink(2.0), 3.0, Stroke::new(1.0, pal.dim));
+            }
+        }
+        if underline {
+            ui.painter().line_segment(
+                [
+                    pos2(rect.left() + 8.0, rect.bottom() - 1.0),
+                    pos2(rect.right() - 8.0, rect.bottom() - 1.0),
+                ],
+                Stroke::new(2.0, pal.accent),
+            );
+        }
+        resp
     }
 
     fn launch(&mut self, l: &Launch) {
@@ -262,6 +415,7 @@ impl ShellApp {
             Power::Restart => win::run_hidden("shutdown /r /t 0"),
             Power::Shutdown => win::run_hidden("shutdown /s /t 0"),
             Power::BackToExplorer => {
+                self.unshelve_all();
                 let _ = install::uninstall_shell();
                 // Start Explorer after we've exited so it becomes the shell.
                 win::run_hidden("ping -n 3 127.0.0.1 >nul & start \"\" explorer.exe");
@@ -292,8 +446,36 @@ impl ShellApp {
                 merged.push(f);
             }
         }
+        // Minimize to tray: hide minimized windows and show them as tray icons.
+        if self.cfg.minimize_to_tray {
+            let mut changed = false;
+            for t in &merged {
+                if t.minimized && !self.shelved.contains(&t.hwnd) {
+                    win::hide(t.hwnd);
+                    self.shelved.push(t.hwnd);
+                    changed = true;
+                }
+            }
+            merged.retain(|t| !self.shelved.contains(&t.hwnd));
+            if changed {
+                save_shelved(&self.shelved);
+            }
+        }
+        let before = self.shelved.len();
+        self.shelved.retain(|h| win::is_window(*h));
+        if self.shelved.len() != before {
+            save_shelved(&self.shelved);
+        }
+
+        // Drop tray icons of programs that died without removing them.
+        if let Some(t) = &self.tray {
+            let mut st = t.lock().unwrap_or_else(|p| p.into_inner());
+            st.icons.retain(|i| win::is_window(i.hwnd));
+        }
+
+        let shelved = self.shelved.clone();
         self.icon_of
-            .retain(|h, _| merged.iter().any(|t| t.hwnd == *h));
+            .retain(|h, _| merged.iter().any(|t| t.hwnd == *h) || shelved.contains(h));
         self.hidden_for_desktop
             .retain(|h| merged.iter().any(|t| t.hwnd == *h));
         self.tasks = merged;
@@ -326,6 +508,8 @@ impl ShellApp {
 
     fn panel_ui(&mut self, ctx: &egui::Context, pal: &Palette) {
         let mut actions: Vec<PanelAction> = Vec::new();
+        let mut hovered: Option<(String, f32)> = None;
+        let mut hover_id: Option<(isize, u32)> = None;
         egui::CentralPanel::default()
             .frame(
                 Frame::none()
@@ -381,6 +565,9 @@ impl ShellApp {
                         if r.middle_clicked() {
                             actions.push(PanelAction::Close(t.hwnd));
                         }
+                        if r.hovered() {
+                            hovered = Some((t.title.clone(), r.rect.center().x));
+                        }
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -424,12 +611,93 @@ impl ShellApp {
                         {
                             actions.push(PanelAction::Uri("ms-settings:network-status"));
                         }
+                        // ---- notification area (layout is right-to-left, so iterate reversed)
+                        let icons_now = self.tray_icons();
+                        let inline_n = icons_now.len().min(TRAY_INLINE);
+                        for ic in icons_now[..inline_n].iter().rev() {
+                            let tex = self.tray_texture(ctx, ic);
+                            let r = Self::tray_slot(ui, tex.as_ref(), false, pal);
+                            let x = r.rect.center().x;
+                            let id = (ic.hwnd, ic.uid);
+                            if r.hovered() {
+                                hovered = Some((ic.tip.clone(), x));
+                                if self.last_hover != Some(id) {
+                                    actions.push(PanelAction::Tray(
+                                        ic.hwnd,
+                                        ic.uid,
+                                        Click::Hover,
+                                        x,
+                                    ));
+                                }
+                                hover_id = Some(id);
+                            }
+                            if r.double_clicked() {
+                                actions.push(PanelAction::Tray(ic.hwnd, ic.uid, Click::Double, x));
+                            } else if r.clicked() {
+                                actions.push(PanelAction::Tray(ic.hwnd, ic.uid, Click::Left, x));
+                            }
+                            if r.secondary_clicked() {
+                                actions.push(PanelAction::Tray(ic.hwnd, ic.uid, Click::Right, x));
+                            }
+                            if r.middle_clicked() {
+                                actions.push(PanelAction::Tray(ic.hwnd, ic.uid, Click::Middle, x));
+                            }
+                        }
+                        // Windows minimized to tray (blue underline).
+                        for h in self.shelved.clone().iter().rev() {
+                            let tex = self.tex_window(ctx, *h);
+                            let r = Self::tray_slot(ui, tex.as_ref(), true, pal);
+                            if r.hovered() {
+                                hovered = Some((
+                                    "Minimized to tray \u{2013} click to restore".into(),
+                                    r.rect.center().x,
+                                ));
+                            }
+                            if r.clicked() || r.secondary_clicked() {
+                                actions.push(PanelAction::Unshelve(*h));
+                            }
+                        }
+                        if icons_now.len() > TRAY_INLINE {
+                            let r = icons::tool_button_sized(
+                                ui,
+                                Tool::Up,
+                                self.overflow_open,
+                                true,
+                                "",
+                                vec2(24.0, 36.0),
+                            );
+                            if r.hovered() {
+                                hovered = Some(("Show hidden icons".into(), r.rect.center().x));
+                            }
+                            if r.clicked() {
+                                actions.push(PanelAction::ToggleOverflow);
+                            }
+                        }
                     });
                 });
             });
 
+        self.last_hover = hover_id;
+        // Tooltip (drawn in its own small window above the panel).
+        self.tip = match (hovered, self.tip.take()) {
+            (Some((text, x)), Some((old, _, since))) if old == text => Some((text, x, since)),
+            (Some((text, x)), _) if !text.is_empty() => Some((text, x, Instant::now())),
+            _ => None,
+        };
+
         for a in actions {
             match a {
+                PanelAction::Tray(h, uid, kind, x) => self.send_tray_click(ctx, h, uid, kind, x),
+                PanelAction::Unshelve(h) => self.unshelve(h),
+                PanelAction::ToggleOverflow => {
+                    if self.overflow_open {
+                        self.overflow_open = false;
+                        self.overflow_closed_at = Instant::now();
+                    } else if self.overflow_closed_at.elapsed() > Duration::from_millis(300) {
+                        self.overflow_open = true;
+                        self.overflow_seen_focus = false;
+                    }
+                }
                 PanelAction::ToggleLauncher => {
                     let open = !self.launcher_open;
                     self.open_launcher(open);
@@ -671,6 +939,15 @@ impl ShellApp {
                             if ui.small_button("Task Manager").clicked() {
                                 launch = Some(Launch::Cmd("taskmgr.exe".into()));
                             }
+                            if ui
+                                .checkbox(&mut self.cfg.minimize_to_tray, "Minimize to tray")
+                                .changed()
+                            {
+                                self.cfg.save();
+                                if !self.cfg.minimize_to_tray {
+                                    self.unshelve_all();
+                                }
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let armed = self.power_armed.is_some_and(|(p, t)| {
                                     p == Power::BackToExplorer
@@ -711,6 +988,242 @@ impl ShellApp {
         if close {
             self.open_launcher(false);
         }
+    }
+
+    // ------------------------------------------------------------ tray popups
+
+    /// Hidden tray icons behind the ^ button, like the Windows overflow flyout.
+    fn overflow_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let hidden: Vec<TrayIcon> = self.tray_icons().into_iter().skip(TRAY_INLINE).collect();
+        if hidden.is_empty() {
+            self.overflow_open = false;
+            return;
+        }
+        let screen = Self::screen_points(ctx);
+        let cols = 5usize;
+        let rows = hidden.len().div_ceil(cols);
+        let size = vec2(cols as f32 * 36.0 + 16.0, rows as f32 * 40.0 + 16.0);
+        let x = (screen.x - size.x - 260.0).max(0.0);
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Tray")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size(size)
+            .with_position([x, screen.y - PANEL_H - size.y - 4.0]);
+
+        let mut close = false;
+        let mut clicks: Vec<(isize, u32, Click, f32)> = Vec::new();
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of("delfin_tray_overflow"),
+            builder,
+            |ctx, _| {
+                let focused = ctx.input(|i| i.viewport().focused);
+                if focused == Some(true) {
+                    self.overflow_seen_focus = true;
+                }
+                if self.overflow_seen_focus && focused == Some(false) {
+                    close = true;
+                }
+                if !self.overflow_seen_focus {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::none()
+                            .fill(pal.window)
+                            .stroke(Stroke::new(1.0, pal.border))
+                            .inner_margin(Margin::same(8.0)),
+                    )
+                    .show(ctx, |ui| {
+                        for row in hidden.chunks(cols) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for ic in row {
+                                    let tex = self.tray_texture(ctx, ic);
+                                    let r = Self::tray_slot(ui, tex.as_ref(), false, pal);
+                                    let r = if ic.tip.is_empty() {
+                                        r
+                                    } else {
+                                        r.on_hover_text(&ic.tip)
+                                    };
+                                    let ax = x + r.rect.center().x;
+                                    if r.double_clicked() {
+                                        clicks.push((ic.hwnd, ic.uid, Click::Double, ax));
+                                    } else if r.clicked() {
+                                        clicks.push((ic.hwnd, ic.uid, Click::Left, ax));
+                                    }
+                                    if r.secondary_clicked() {
+                                        clicks.push((ic.hwnd, ic.uid, Click::Right, ax));
+                                    }
+                                }
+                            });
+                        }
+                    });
+            },
+        );
+        for (h, uid, kind, ax) in clicks {
+            self.send_tray_click(ctx, h, uid, kind, ax);
+            close = true;
+        }
+        if close {
+            self.overflow_open = false;
+            self.overflow_closed_at = Instant::now();
+        }
+    }
+
+    /// Notifications sent with NIF_INFO (Explorer would show them as toasts).
+    fn balloon_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(shared) = self.tray.clone() else {
+            return;
+        };
+        let first = {
+            let st = shared.lock().unwrap_or_else(|p| p.into_inner());
+            st.balloons.first().cloned()
+        };
+        let Some(b) = first else {
+            self.balloon_since = None;
+            return;
+        };
+        let since = *self.balloon_since.get_or_insert_with(Instant::now);
+        let pop = |shared: &tray::Shared| {
+            let mut st = shared.lock().unwrap_or_else(|p| p.into_inner());
+            if !st.balloons.is_empty() {
+                st.balloons.remove(0);
+            }
+        };
+        if since.elapsed() > Duration::from_secs(BALLOON_SECS) {
+            tray::post(
+                b.hwnd,
+                b.uid,
+                b.callback,
+                b.version,
+                tray::NIN_BALLOONTIMEOUT,
+                (0, 0),
+            );
+            pop(&shared);
+            self.balloon_since = None;
+            return;
+        }
+
+        let screen = Self::screen_points(ctx);
+        let size = vec2(380.0, 104.0);
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Notification")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_active(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size(size)
+            .with_position([screen.x - size.x - 10.0, screen.y - PANEL_H - size.y - 10.0]);
+
+        let mut clicked = false;
+        let mut dismissed = false;
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of("delfin_balloon"),
+            builder,
+            |ctx, _| {
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::none()
+                            .fill(pal.window)
+                            .stroke(Stroke::new(1.0, pal.accent))
+                            .inner_margin(Margin::same(12.0)),
+                    )
+                    .show(ctx, |ui| {
+                        let all =
+                            ui.interact(ui.max_rect(), egui::Id::new("balloon_bg"), Sense::click());
+                        ui.horizontal(|ui| {
+                            let title = if b.title.is_empty() {
+                                "Notification"
+                            } else {
+                                b.title.as_str()
+                            };
+                            ui.label(RichText::new(title).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if icons::tool_button_sized(
+                                    ui,
+                                    Tool::Close,
+                                    false,
+                                    true,
+                                    "",
+                                    vec2(20.0, 20.0),
+                                )
+                                .clicked()
+                                {
+                                    dismissed = true;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&b.text).color(pal.dim));
+                        if all.clicked() {
+                            clicked = true;
+                        }
+                    });
+            },
+        );
+        if clicked || dismissed {
+            let msg = if dismissed {
+                tray::NIN_BALLOONTIMEOUT
+            } else {
+                tray::NIN_BALLOONUSERCLICK
+            };
+            if !dismissed {
+                allow_foreground(b.hwnd);
+            }
+            tray::post(b.hwnd, b.uid, b.callback, b.version, msg, (0, 0));
+            pop(&shared);
+            self.balloon_since = None;
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    /// Tooltips can't fit inside the 44 px panel window, so they get their own.
+    fn tooltip_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some((text, x, since)) = self.tip.clone() else {
+            return;
+        };
+        if since.elapsed() < Duration::from_millis(450) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+            return;
+        }
+        let screen = Self::screen_points(ctx);
+        let lines = text.lines().count().max(1) as f32;
+        let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
+        let size = vec2(
+            (longest * 7.2 + 20.0).clamp(40.0, 420.0),
+            lines * 17.0 + 12.0,
+        );
+        let left = (x - size.x / 2.0).clamp(2.0, (screen.x - size.x - 2.0).max(2.0));
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Tooltip")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_active(false)
+            .with_mouse_passthrough(true)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size(size)
+            .with_position([left, screen.y - PANEL_H - size.y - 4.0]);
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of("delfin_tooltip"),
+            builder,
+            |ctx, _| {
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::none()
+                            .fill(pal.header)
+                            .stroke(Stroke::new(1.0, pal.border))
+                            .inner_margin(Margin::symmetric(8.0, 5.0)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(&text).size(12.5));
+                    });
+            },
+        );
     }
 
     // ------------------------------------------------------------ desktop
@@ -1010,6 +1523,11 @@ impl eframe::App for ShellApp {
         if self.launcher_open {
             self.launcher_viewport(ctx, &pal);
         }
+        if self.overflow_open {
+            self.overflow_viewport(ctx, &pal);
+        }
+        self.balloon_viewport(ctx, &pal);
+        self.tooltip_viewport(ctx, &pal);
         // Clock + task list refresh.
         ctx.request_repaint_after(Duration::from_millis(500));
     }
@@ -1136,4 +1654,17 @@ fn clock(ui: &mut Ui, pal: &Palette) -> egui::Response {
         pal.dim,
     );
     resp
+}
+
+impl Drop for ShellApp {
+    fn drop(&mut self) {
+        // Never leave windows hidden when the shell exits.
+        self.unshelve_all();
+    }
+}
+
+fn allow_foreground(hwnd: isize) {
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(win::pid_of(hwnd));
+    }
 }

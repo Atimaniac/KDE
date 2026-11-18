@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, EnumWindows, FindWindowW, GetClassLongPtrW, GetForegroundWindow, GetIconInfo,
     GetMessageW, GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
     SendMessageTimeoutW, SetForegroundWindow, ShowWindow, SystemParametersInfoW, HICON, ICONINFO,
     MSG,
 };
@@ -149,6 +149,33 @@ pub fn close(h: isize) {
     unsafe {
         PostMessageW(h as HWND, 0x0010 /* WM_CLOSE */, 0, 0);
     }
+}
+
+/// Hide a window completely (used for minimize-to-tray).
+pub fn hide(h: isize) {
+    unsafe {
+        ShowWindow(h as HWND, 0 /* SW_HIDE */);
+    }
+}
+
+/// Bring back a window hidden with `hide`.
+pub fn unhide(h: isize) {
+    let hwnd = h as HWND;
+    unsafe {
+        ShowWindow(hwnd, 5 /* SW_SHOW */);
+        ShowWindow(hwnd, 9 /* SW_RESTORE */);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+pub fn is_window(h: isize) -> bool {
+    unsafe { IsWindow(h as HWND) != 0 }
+}
+
+pub fn find_class(class: &str) -> Option<isize> {
+    let w = wide(class);
+    let h = unsafe { FindWindowW(w.as_ptr(), null()) };
+    (!h.is_null()).then_some(h as isize)
 }
 
 pub fn find_window(title: &str) -> Option<isize> {

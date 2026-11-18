@@ -14,6 +14,12 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
 - **Launcher** (Kickoff-like): all Start Menu apps with search. Enter runs the first match, or the
   typed text as a command (like the Run dialog). Lock / Log Out / Restart / Shut Down (click twice).
 - **Desktop**: your Windows wallpaper, Desktop folder icons (double-click to open), right-click menu.
+- **System tray** (notification area) that works like Explorer's: programs such as Steam,
+  Discord or OneDrive show their icons, can hide to the tray when minimized, and get left / right /
+  double / middle clicks and their context menus. Tooltips, balloon notifications and a **^**
+  overflow for icons beyond 8. Already-running programs re-add their icons when the shell starts.
+- **Minimize to tray** (optional, launcher → *Minimize to tray*): any minimized window is hidden
+  into the tray (blue underline); click it to bring it back.
 - **Startup apps** from the registry *Run* keys and Startup folders (disabled entries in Task
   Manager are respected).
 - **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher.
@@ -40,7 +46,7 @@ then run `%LOCALAPPDATA%\Programs\Delfin\delfin.exe --uninstall-shell`.
 
 ### Not there yet
 
-- Notification-area (tray) icons of other apps (Steam, Discord…) aren't shown yet.
+- Windows 10/11 *toast* notifications (WinRT apps) aren't shown; classic tray balloons are.
 - Volume/network are shortcuts to Settings, not flyouts.
 - Apps that call `explorer.exe /select,…` ("Show in folder") still open an Explorer window.
 - Primary monitor only.
