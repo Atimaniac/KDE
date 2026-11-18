@@ -240,6 +240,22 @@ pub enum Tool {
     Refresh,
     Plus,
     Close,
+    Speaker,
+    Network,
+    Power,
+    Lock,
+    Logout,
+    Gear,
+    Desktop,
+}
+
+fn arc(c: Pos2, r: f32, a0: f32, a1: f32) -> Vec<Pos2> {
+    (0..=16)
+        .map(|i| {
+            let a = a0 + (a1 - a0) * i as f32 / 16.0;
+            c + vec2(a.cos(), a.sin()) * r
+        })
+        .collect()
 }
 
 pub fn paint_tool(p: &Painter, rect: Rect, t: Tool, col: Color32) {
@@ -337,6 +353,70 @@ pub fn paint_tool(p: &Painter, rect: Rect, t: Tool, col: Color32) {
             line(vec![c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)]);
             line(vec![c + vec2(3.5, -3.5), c + vec2(-3.5, 3.5)]);
         }
+        Tool::Speaker => {
+            line(vec![
+                c + vec2(-7., -2.5),
+                c + vec2(-4., -2.5),
+                c + vec2(0., -6.),
+                c + vec2(0., 6.),
+                c + vec2(-4., 2.5),
+                c + vec2(-7., 2.5),
+                c + vec2(-7., -2.5),
+            ]);
+            line(arc(c + vec2(0., 0.), 3.5, -0.8, 0.8));
+            line(arc(c + vec2(0., 0.), 6.5, -0.8, 0.8));
+        }
+        Tool::Network => {
+            let base = c + vec2(0., 6.);
+            for r in [4.5, 8.5, 12.5] {
+                line(arc(base, r, -2.36, -0.78));
+            }
+            p.circle_filled(base, 1.5, col);
+        }
+        Tool::Power => {
+            let pi = std::f32::consts::PI;
+            line(arc(c + vec2(0., 1.), 6.5, -pi / 2.0 + 0.7, 1.5 * pi - 0.7));
+            line(vec![c + vec2(0., -7.), c + vec2(0., 0.)]);
+        }
+        Tool::Lock => {
+            let pi = std::f32::consts::PI;
+            p.rect_stroke(
+                Rect::from_min_max(c + vec2(-5.5, -1.), c + vec2(5.5, 7.)),
+                1.0,
+                s,
+            );
+            let mut sh = vec![c + vec2(-3.5, -1.)];
+            sh.extend(arc(c + vec2(0., -3.5), 3.5, pi, 2.0 * pi));
+            sh.push(c + vec2(3.5, -1.));
+            line(sh);
+        }
+        Tool::Logout => {
+            line(vec![
+                c + vec2(1., -7.),
+                c + vec2(-6., -7.),
+                c + vec2(-6., 7.),
+                c + vec2(1., 7.),
+            ]);
+            line(vec![c + vec2(-2., 0.), c + vec2(7., 0.)]);
+            line(vec![c + vec2(4., -3.), c + vec2(7., 0.), c + vec2(4., 3.)]);
+        }
+        Tool::Gear => {
+            p.circle_stroke(c, 3., s);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let d = vec2(a.cos(), a.sin());
+                line(vec![c + d * 5., c + d * 7.5]);
+            }
+        }
+        Tool::Desktop => {
+            p.rect_stroke(
+                Rect::from_min_max(c + vec2(-7.5, -6.), c + vec2(7.5, 4.)),
+                1.0,
+                s,
+            );
+            line(vec![c + vec2(0., 4.), c + vec2(0., 7.)]);
+            line(vec![c + vec2(-4., 7.), c + vec2(4., 7.)]);
+        }
     }
 }
 
@@ -375,7 +455,11 @@ pub fn tool_button_sized(
         };
         paint_tool(ui.painter(), rect, t, col);
     }
-    resp.on_hover_text(tip)
+    if tip.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(tip)
+    }
 }
 
 pub fn tool_button(ui: &mut Ui, t: Tool, selected: bool, enabled: bool, tip: &str) -> Response {

@@ -1,6 +1,51 @@
-# Delfin — a KDE Dolphin-style file manager for Windows (Rust)
+# Delfin — a KDE-style desktop for Windows (Rust)
 
-Breeze Dark / Breeze Light look, written in Rust with egui. It doesn't replace Windows Explorer; it runs as a normal app next to it.
+A Dolphin-style file manager **and** a full desktop shell that replaces `explorer.exe`:
+bottom panel like KDE Plasma, application launcher, desktop with your wallpaper.
+Breeze Dark / Breeze Light look, written in Rust with egui.
+
+## Desktop shell (no Windows Explorer)
+
+`delfin.exe --shell` runs:
+
+- **Panel** at the bottom: launcher button, pinned file manager + terminal, task list with real
+  window icons (click = switch / minimize, middle click = close), sound & network shortcuts,
+  clock, *show desktop* strip. Maximized windows don't cover it.
+- **Launcher** (Kickoff-like): all Start Menu apps with search. Enter runs the first match, or the
+  typed text as a command (like the Run dialog). Lock / Log Out / Restart / Shut Down (click twice).
+- **Desktop**: your Windows wallpaper, Desktop folder icons (double-click to open), right-click menu.
+- **Startup apps** from the registry *Run* keys and Startup folders (disabled entries in Task
+  Manager are respected).
+- **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher.
+- Folders opened anywhere in Windows open in Delfin.
+
+### Try it without installing
+
+```
+taskkill /f /im explorer.exe
+target\release\delfin.exe --shell
+```
+To get Explorer back: launcher → *Back to Explorer*, or Ctrl+Alt+Del → Task Manager →
+*Run new task* → `explorer.exe`.
+
+### Install as your shell
+
+Delfin menu (☰) → *System* → **Use Delfin as Windows shell…**, or `delfin.exe --install-shell`.
+Then sign out and back in. It's per user (HKCU, no admin). The exe is copied to
+`%LOCALAPPDATA%\Programs\Delfin\delfin.exe`.
+
+**Go back:** launcher → *Back to Explorer* (click twice), or `delfin.exe --uninstall-shell`.
+Emergency (black screen): Ctrl+Alt+Del → Task Manager → *Run new task* → `explorer.exe`,
+then run `%LOCALAPPDATA%\Programs\Delfin\delfin.exe --uninstall-shell`.
+
+### Not there yet
+
+- Notification-area (tray) icons of other apps (Steam, Discord…) aren't shown yet.
+- Volume/network are shortcuts to Settings, not flyouts.
+- Apps that call `explorer.exe /select,…` ("Show in folder") still open an Explorer window.
+- Primary monitor only.
+
+## File manager
 
 ## Build & run
 

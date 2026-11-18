@@ -250,6 +250,9 @@ enum Dialog {
     ConfirmDelete {
         paths: Vec<PathBuf>,
     },
+    Shell {
+        install: bool,
+    },
     About,
 }
 
@@ -257,6 +260,7 @@ enum DialogResult {
     Rename(PathBuf, String),
     NewFolder(PathBuf, String),
     Delete(Vec<PathBuf>),
+    Shell(bool),
 }
 
 enum Action {
@@ -281,6 +285,7 @@ enum Action {
     Refresh,
     ShowInfo,
     SelectAll,
+    FolderHandler(bool),
 }
 
 #[derive(Default)]
@@ -691,6 +696,11 @@ impl App {
                 self.drives = platform::drives();
             }
             Action::ShowInfo => self.cfg.info_panel = true,
+            Action::FolderHandler(on) => match platform::set_folder_handler(on) {
+                Ok(()) if on => self.info("Folders now open in Delfin"),
+                Ok(()) => self.info("Folders open in Windows Explorer again"),
+                Err(e) => self.err(e),
+            },
             Action::SelectAll => self.with_pane(|p, _| {
                 p.selected = p
                     .visible
@@ -1157,6 +1167,27 @@ impl App {
                 );
                 item(ui, "Add Folder to Places", "", Action::AddPlace(cwd));
                 item(ui, "Refresh", "F5", Action::Refresh);
+                ui.separator();
+                ui.label(RichText::new("System").weak());
+                let mut handler = platform::folder_handler_set();
+                if ui
+                    .checkbox(&mut handler, "Open folders in Delfin by default")
+                    .changed()
+                {
+                    acts.push(Action::FolderHandler(handler));
+                }
+                let installed = platform::shell_installed();
+                let label = if installed {
+                    "Restore Windows Explorer as shell…"
+                } else {
+                    "Use Delfin as Windows shell…"
+                };
+                if ui.button(label).clicked() {
+                    self.dialog = Dialog::Shell {
+                        install: !installed,
+                    };
+                    ui.memory_mut(|m| m.close_popup());
+                }
                 ui.separator();
                 if ui.button("About Delfin").clicked() {
                     self.dialog = Dialog::About;
@@ -1626,6 +1657,54 @@ impl App {
                     });
                 });
             }
+            Dialog::Shell { install } => {
+                let install = *install;
+                let title = if install {
+                    "Use Delfin as Windows Shell"
+                } else {
+                    "Restore Windows Explorer"
+                };
+                window(title).show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    if install {
+                        ui.label(
+                            "Delfin will replace explorer.exe for your user account: bottom panel \
+                             with app launcher and task list, desktop with your wallpaper, and \
+                             Delfin as the folder window.",
+                        );
+                        ui.add_space(6.0);
+                        ui.label("It takes effect after you sign out and sign back in. No admin rights needed.");
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("How to go back:").strong());
+                        ui.label("• Launcher → \"Back to Explorer\" (click twice)");
+                        ui.label(
+                            "• Emergency: Ctrl+Alt+Del → Task Manager → Run new task → explorer.exe, \
+                             then run delfin.exe --uninstall-shell",
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "Tip: try it first without installing: close Explorer \
+                                 (taskkill /f /im explorer.exe) and run delfin.exe --shell.",
+                            )
+                            .color(pal.dim),
+                        );
+                    } else {
+                        ui.label("Windows Explorer will be your shell again after you sign out and back in.");
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ok = if install { "Use Delfin as shell" } else { "Restore Explorer" };
+                        if ui.button(RichText::new(ok).strong()).clicked() {
+                            result = Some(DialogResult::Shell(install));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
             Dialog::About => {
                 window("About Delfin").show(ctx, |ui| {
                     ui.label(RichText::new("Delfin 0.1").strong().size(16.0));
@@ -1682,6 +1761,24 @@ impl App {
                         self.select_path(&target);
                     }
                     Err(e) => self.err(format!("Cannot create folder: {e}")),
+                }
+            }
+            Some(DialogResult::Shell(install)) => {
+                let r = if install {
+                    platform::install_shell()
+                } else {
+                    platform::uninstall_shell()
+                };
+                match r {
+                    Ok(msg) => {
+                        self.info(if install {
+                            "Delfin set as shell. Sign out and back in."
+                        } else {
+                            "Explorer restored."
+                        });
+                        platform::message("Delfin", &msg);
+                    }
+                    Err(e) => self.err(e),
                 }
             }
             Some(DialogResult::Delete(paths)) => {

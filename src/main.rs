@@ -6,14 +6,47 @@ mod config;
 mod fsops;
 mod icons;
 mod platform;
+#[cfg(windows)]
+mod shell;
 mod theme;
 
 use eframe::egui;
 use std::path::PathBuf;
 
 fn main() -> Result<(), eframe::Error> {
-    // Optional: start in a folder passed on the command line, e.g. `delfin.exe C:\Projects`
-    let start = std::env::args().nth(1).map(PathBuf::from);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+
+    // Desktop shell mode (panel + launcher + desktop), replaces explorer.exe.
+    if has("--shell") {
+        #[cfg(windows)]
+        return shell::run();
+        #[cfg(not(windows))]
+        {
+            platform::message("Delfin", "Shell mode is only available on Windows.");
+            return Ok(());
+        }
+    }
+    if has("--install-shell") {
+        match platform::install_shell() {
+            Ok(m) => platform::message("Delfin", &m),
+            Err(e) => platform::message("Delfin – error", &e),
+        }
+        return Ok(());
+    }
+    if has("--uninstall-shell") {
+        match platform::uninstall_shell() {
+            Ok(m) => platform::message("Delfin", &m),
+            Err(e) => platform::message("Delfin – error", &e),
+        }
+        return Ok(());
+    }
+
+    // File manager, optionally in a folder: `delfin.exe C:\Projects`
+    let start = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

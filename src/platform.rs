@@ -150,3 +150,56 @@ mod imp {
 }
 
 pub use imp::{drives, init, open_terminal, space};
+
+// ---------------------------------------------------------------- shell install
+#[cfg(windows)]
+pub use crate::shell::install::{
+    folder_handler_set, install_shell, set_folder_handler, shell_installed, uninstall_shell,
+};
+
+#[cfg(not(windows))]
+mod shell_stub {
+    pub fn shell_installed() -> bool {
+        false
+    }
+    pub fn folder_handler_set() -> bool {
+        false
+    }
+    pub fn install_shell() -> Result<String, String> {
+        Err("Only available on Windows".into())
+    }
+    pub fn uninstall_shell() -> Result<String, String> {
+        Err("Only available on Windows".into())
+    }
+    pub fn set_folder_handler(_on: bool) -> Result<(), String> {
+        Err("Only available on Windows".into())
+    }
+}
+#[cfg(not(windows))]
+pub use shell_stub::*;
+
+/// Show a message box (the release build has no console).
+pub fn message(title: &str, text: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW;
+        let w = |s: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(Some(0))
+                .collect()
+        };
+        let (t, c) = (w(text), w(title));
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                t.as_ptr(),
+                c.as_ptr(),
+                0x40, /* MB_ICONINFORMATION */
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    println!("{title}: {text}");
+}
