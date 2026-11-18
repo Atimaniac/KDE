@@ -1,0 +1,25 @@
+[package]
+name = "delfin"
+version = "0.1.0"
+edition = "2021"
+description = "A KDE Dolphin-style file manager for Windows, written in Rust"
+
+[dependencies]
+eframe = "0.29"
+open = "5"
+trash = "5"
+dirs = "5"
+chrono = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
