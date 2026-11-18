@@ -27,6 +27,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_System_Com",
+    "Win32_System_Power",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Devices_Display",
 ] }
 
 [profile.release]

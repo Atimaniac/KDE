@@ -350,13 +350,33 @@ pub fn file_icon_rgba(path: &Path, large: bool) -> Option<(usize, usize, Vec<u8>
     unsafe {
         let mut info: SHFILEINFOW = std::mem::zeroed();
         let flags: u32 = 0x100 /* SHGFI_ICON */ | (if large { 0 } else { 1 /* SHGFI_SMALLICON */ });
-        let r = SHGetFileInfoW(
-            w.as_ptr(),
-            0,
-            &mut info,
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            flags,
-        );
+        // Shell locations such as `shell:AppsFolder\<app id>` (Store apps)
+        // aren't files: resolve them to an item ID list first.
+        let r = if path.to_string_lossy().starts_with("shell:") {
+            use windows_sys::Win32::System::Com::CoTaskMemFree;
+            use windows_sys::Win32::UI::Shell::SHParseDisplayName;
+            let mut pidl = null_mut();
+            if SHParseDisplayName(w.as_ptr(), null_mut(), &mut pidl, 0, null_mut()) < 0 || pidl.is_null() {
+                return None;
+            }
+            let r = SHGetFileInfoW(
+                pidl as *const u16,
+                0,
+                &mut info,
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                flags | 0x8, /* SHGFI_PIDL */
+            );
+            CoTaskMemFree(pidl as *const c_void);
+            r
+        } else {
+            SHGetFileInfoW(
+                w.as_ptr(),
+                0,
+                &mut info,
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                flags,
+            )
+        };
         if r == 0 || info.hIcon.is_null() {
             return None;
         }

@@ -8,6 +8,7 @@
 //! * File-manager windows are separate `delfin.exe` processes.
 
 pub mod install;
+mod quick;
 mod startmenu;
 mod startup;
 mod tray;
@@ -37,6 +38,8 @@ const DESKTOP_TITLE: &str = "Delfin Desktop";
 /// Tray icons shown directly on the panel; the rest go behind the ^ button.
 const TRAY_INLINE: usize = 8;
 const BALLOON_SECS: u64 = 7;
+const QUICK_W: f32 = 380.0;
+const QUICK_H: f32 = 600.0;
 
 pub fn run() -> Result<(), eframe::Error> {
     if !win::single_instance("Local\\DelfinShell") {
@@ -89,6 +92,7 @@ enum PanelAction {
     Tray(isize, u32, Click, f32),
     Unshelve(isize),
     ToggleOverflow,
+    ToggleQuick,
 }
 
 enum DeskAction {
@@ -137,6 +141,15 @@ struct ShellApp {
     balloon_since: Option<Instant>,
     /// Windows hidden by "minimize to tray".
     shelved: Vec<isize>,
+    // quick settings
+    qp: quick::QuickPanel,
+    quick_open: bool,
+    quick_seen_focus: bool,
+    quick_closed_at: Instant,
+    vol_state: Option<(f32, bool)>,
+    wifi_sig: Option<u32>,
+    last_status_poll: Instant,
+    store_apps: Receiver<Vec<AppEntry>>,
     // shared
     textures: HashMap<String, Option<TextureHandle>>,
     hotkeys: Receiver<win::Hotkey>,
@@ -224,6 +237,14 @@ impl ShellApp {
             tip: None,
             balloon_since: None,
             shelved: Vec::new(),
+            qp: quick::QuickPanel::new(&cc.egui_ctx),
+            quick_open: false,
+            quick_seen_focus: false,
+            quick_closed_at: long_ago,
+            vol_state: None,
+            wifi_sig: None,
+            last_status_poll: long_ago,
+            store_apps: startmenu::scan_store_apps(cc.egui_ctx.clone()),
             textures: HashMap::new(),
             hotkeys: rx,
         };
@@ -347,7 +368,7 @@ impl ShellApp {
             }
             None => {
                 ui.painter()
-                    .rect_stroke(ir.shrink(2.0), 3.0, Stroke::new(1.0, pal.dim));
+                    .rect_stroke(ir.shrink(2.0), 3.0, Stroke::new(1.0_f32, pal.dim));
             }
         }
         if underline {
@@ -356,7 +377,7 @@ impl ShellApp {
                     pos2(rect.left() + 8.0, rect.bottom() - 1.0),
                     pos2(rect.right() - 8.0, rect.bottom() - 1.0),
                 ],
-                Stroke::new(2.0, pal.accent),
+                Stroke::new(2.0_f32, pal.accent),
             );
         }
         resp
@@ -384,6 +405,7 @@ impl ShellApp {
             if self.launcher_closed_at.elapsed() < Duration::from_millis(300) {
                 return;
             }
+            self.open_quick(false);
             self.launcher_query.clear();
             self.launcher_focus_pending = true;
             self.launcher_seen_focus = false;
@@ -392,6 +414,97 @@ impl ShellApp {
             self.launcher_closed_at = Instant::now();
         }
         self.launcher_open = open;
+    }
+
+    fn open_quick(&mut self, open: bool) {
+        if open == self.quick_open {
+            return;
+        }
+        if open {
+            // Clicking the button while the panel is open first takes its focus
+            // away (which closes it); don't immediately reopen.
+            if self.quick_closed_at.elapsed() < Duration::from_millis(300) {
+                return;
+            }
+            self.open_launcher(false);
+            self.quick_seen_focus = false;
+            self.qp.on_open();
+            self.vol_state = self.qp.volume_state();
+        } else {
+            self.quick_closed_at = Instant::now();
+            self.qp.on_close();
+        }
+        self.quick_open = open;
+    }
+
+    /// Volume and Wi-Fi signal for the panel icon (every 2 s).
+    fn poll_status(&mut self) {
+        if self.last_status_poll.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_status_poll = Instant::now();
+        if !self.quick_open {
+            self.qp.refresh_volume(); // the default device may have changed
+        }
+        self.vol_state = self.qp.volume_state();
+        self.wifi_sig = self.qp.wifi_signal();
+    }
+
+    fn quick_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let screen = Self::screen_points(ctx);
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Quick Settings")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([QUICK_W, QUICK_H])
+            .with_position([screen.x - QUICK_W - 8.0, screen.y - PANEL_H - QUICK_H - 8.0]);
+
+        let mut close = false;
+        let mut action = None;
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of("delfin_quick_settings"),
+            builder,
+            |ctx, _| {
+                let focused = ctx.input(|i| i.viewport().focused);
+                if focused == Some(true) {
+                    self.quick_seen_focus = true;
+                }
+                if self.quick_seen_focus && focused == Some(false) {
+                    close = true;
+                }
+                if !self.quick_seen_focus {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::none()
+                            .fill(pal.window)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .inner_margin(Margin::same(14.0)),
+                    )
+                    .show(ctx, |ui| {
+                        action = self.qp.ui(ui, pal);
+                    });
+            },
+        );
+        match action {
+            Some(quick::QuickAction::Open(uri)) => {
+                let _ = open::that(uri);
+                close = true;
+            }
+            Some(quick::QuickAction::Close) => close = true,
+            None => {}
+        }
+        if close {
+            self.open_quick(false);
+        } else {
+            self.vol_state = self.qp.volume_state();
+        }
     }
 
     fn show_desktop(&mut self) {
@@ -520,7 +633,7 @@ impl ShellApp {
                 let sr = ctx.screen_rect();
                 ui.painter().line_segment(
                     [sr.left_top(), sr.right_top()],
-                    Stroke::new(1.0, pal.border),
+                    Stroke::new(1.0_f32, pal.border),
                 );
 
                 ui.horizontal_centered(|ui| {
@@ -578,7 +691,7 @@ impl ShellApp {
                         }
                         ui.painter().line_segment(
                             [r.left_top(), r.left_bottom()],
-                            Stroke::new(1.0, pal.border),
+                            Stroke::new(1.0_f32, pal.border),
                         );
                         if resp.clicked() {
                             actions.push(PanelAction::ShowDesktop);
@@ -587,29 +700,36 @@ impl ShellApp {
                         if clock(ui, pal).clicked() {
                             actions.push(PanelAction::Uri("ms-settings:dateandtime"));
                         }
-                        if icons::tool_button_sized(
-                            ui,
-                            Tool::Speaker,
-                            false,
-                            true,
-                            "",
-                            vec2(30.0, 36.0),
-                        )
-                        .clicked()
+                        // Wi-Fi + volume in one button, like Windows 11: opens Quick Settings.
                         {
-                            actions.push(PanelAction::Uri("ms-settings:sound"));
-                        }
-                        if icons::tool_button_sized(
-                            ui,
-                            Tool::Network,
-                            false,
-                            true,
-                            "",
-                            vec2(30.0, 36.0),
-                        )
-                        .clicked()
-                        {
-                            actions.push(PanelAction::Uri("ms-settings:network-status"));
+                            let (r, resp) = ui.allocate_exact_size(vec2(56.0, 36.0), Sense::click());
+                            let p = ui.painter();
+                            if self.quick_open {
+                                p.rect_filled(r, 4.0, pal.select);
+                            } else if resp.hovered() {
+                                p.rect_filled(r, 4.0, pal.hover);
+                            }
+                            let (left, right) = r.split_left_right_at_fraction(0.5);
+                            quick::paint_wifi(p, left, pal.text, pal.dim.gamma_multiply(0.5), self.wifi_sig);
+                            let level = self
+                                .vol_state
+                                .map(|(l, m)| if m { None } else { Some(l) })
+                                .unwrap_or(Some(1.0));
+                            quick::paint_speaker(p, right, pal.text, level);
+                            if resp.hovered() {
+                                let tip = match self.vol_state {
+                                    Some((_, true)) => "Quick Settings – muted".to_string(),
+                                    Some((l, false)) => format!("Quick Settings – volume {:.0}%", l * 100.0),
+                                    None => "Quick Settings".to_string(),
+                                };
+                                hovered = Some((tip, r.center().x));
+                            }
+                            if resp.clicked() {
+                                actions.push(PanelAction::ToggleQuick);
+                            }
+                            if resp.secondary_clicked() {
+                                actions.push(PanelAction::Uri("ms-settings:sound"));
+                            }
                         }
                         // ---- notification area (layout is right-to-left, so iterate reversed)
                         let icons_now = self.tray_icons();
@@ -698,6 +818,10 @@ impl ShellApp {
                         self.overflow_seen_focus = false;
                     }
                 }
+                PanelAction::ToggleQuick => {
+                    let open = !self.quick_open;
+                    self.open_quick(open);
+                }
                 PanelAction::ToggleLauncher => {
                     let open = !self.launcher_open;
                     self.open_launcher(open);
@@ -764,7 +888,7 @@ impl ShellApp {
                     .frame(
                         Frame::none()
                             .fill(pal.window)
-                            .stroke(Stroke::new(1.0, pal.border))
+                            .stroke(Stroke::new(1.0_f32, pal.border))
                             .inner_margin(Margin::same(12.0)),
                     )
                     .show(ctx, |ui| {
@@ -1033,7 +1157,7 @@ impl ShellApp {
                     .frame(
                         Frame::none()
                             .fill(pal.window)
-                            .stroke(Stroke::new(1.0, pal.border))
+                            .stroke(Stroke::new(1.0_f32, pal.border))
                             .inner_margin(Margin::same(8.0)),
                     )
                     .show(ctx, |ui| {
@@ -1129,7 +1253,7 @@ impl ShellApp {
                     .frame(
                         Frame::none()
                             .fill(pal.window)
-                            .stroke(Stroke::new(1.0, pal.accent))
+                            .stroke(Stroke::new(1.0_f32, pal.accent))
                             .inner_margin(Margin::same(12.0)),
                     )
                     .show(ctx, |ui| {
@@ -1216,7 +1340,7 @@ impl ShellApp {
                     .frame(
                         Frame::none()
                             .fill(pal.header)
-                            .stroke(Stroke::new(1.0, pal.border))
+                            .stroke(Stroke::new(1.0_f32, pal.border))
                             .inner_margin(Margin::symmetric(8.0, 5.0)),
                     )
                     .show(ctx, |ui| {
@@ -1404,7 +1528,7 @@ impl ShellApp {
                             if selected {
                                 ui.painter().rect_filled(r, 6.0, pal.select);
                                 ui.painter()
-                                    .rect_stroke(r, 6.0, Stroke::new(1.0, pal.accent));
+                                    .rect_stroke(r, 6.0, Stroke::new(1.0_f32, pal.accent));
                             } else if resp.hovered() {
                                 ui.painter()
                                     .rect_filled(r, 6.0, Color32::from_white_alpha(30));
@@ -1506,6 +1630,10 @@ impl eframe::App for ShellApp {
         let pal = theme::palette(self.cfg.dark);
         self.place_panel(ctx);
         self.poll();
+        self.poll_status();
+        if let Ok(store) = self.store_apps.try_recv() {
+            startmenu::merge_store_apps(&mut self.apps, store);
+        }
 
         while let Ok(k) = self.hotkeys.try_recv() {
             match k {
@@ -1525,6 +1653,9 @@ impl eframe::App for ShellApp {
         }
         if self.overflow_open {
             self.overflow_viewport(ctx, &pal);
+        }
+        if self.quick_open {
+            self.quick_viewport(ctx, &pal);
         }
         self.balloon_viewport(ctx, &pal);
         self.tooltip_viewport(ctx, &pal);
@@ -1563,7 +1694,7 @@ fn launcher_button(ui: &mut Ui, open: bool, pal: &Palette) -> egui::Response {
         let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / 3.0;
         p.circle_filled(c + vec2(a.cos(), a.sin()) * 5.5, 2.4, Color32::WHITE);
     }
-    p.circle_stroke(c, 5.5, Stroke::new(1.2, Color32::WHITE));
+    p.circle_stroke(c, 5.5, Stroke::new(1.2_f32, Color32::WHITE));
     resp
 }
 
@@ -1605,7 +1736,7 @@ fn task_button(
                 pos2(rect.left() + 6.0, rect.bottom() - 1.0),
                 pos2(rect.right() - 6.0, rect.bottom() - 1.0),
             ],
-            Stroke::new(2.0, line),
+            Stroke::new(2.0_f32, line),
         );
         let ir =
             Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), vec2(22.0, 22.0));

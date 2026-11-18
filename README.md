@@ -9,10 +9,14 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
 `delfin.exe --shell` runs:
 
 - **Panel** at the bottom: launcher button, pinned file manager + terminal, task list with real
-  window icons (click = switch / minimize, middle click = close), sound & network shortcuts,
+  window icons (click = switch / minimize, middle click = close), a Wi-Fi / volume button showing the real signal and volume,
   clock, *show desktop* strip. Maximized windows don't cover it.
-- **Launcher** (Kickoff-like): all Start Menu apps with search. Enter runs the first match, or the
+- **Launcher** (Kickoff-like): all Start Menu apps and Store apps with search. Enter runs the first match, or the
   typed text as a command (like the Run dialog). Lock / Log Out / Restart / Shut Down (click twice).
+- **Quick Settings** (click the Wi-Fi / volume button; right-click opens Sound settings): volume and
+  mute, monitor brightness (DDC/CI monitors and laptop screens), play / pause / next / previous,
+  Wi-Fi on/off and a list of networks to connect to (with a password) or disconnect, battery level
+  on laptops, shortcuts to Windows Settings.
 - **Desktop**: your Windows wallpaper, Desktop folder icons (double-click to open), right-click menu.
 - **System tray** (notification area) that works like Explorer's: programs such as Steam,
   Discord or OneDrive show their icons, can hide to the tray when minimized, and get left / right /
