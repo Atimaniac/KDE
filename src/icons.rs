@@ -162,7 +162,7 @@ pub fn paint_file(p: &Painter, rect: Rect, color: Color32, ext: &str, pal: &Pale
     let t = rect.center().y - h / 2.0;
     let fold = w * 0.28;
 
-    let outline = Stroke::new(1.0, darken(pal.paper, 0.7));
+    let outline = Stroke::new(1.0_f32, darken(pal.paper, 0.7));
     p.add(Shape::convex_polygon(
         vec![
             pos2(l, t),
@@ -206,7 +206,7 @@ pub fn paint_drive(p: &Painter, rect: Rect) {
     let r = Rect::from_center_size(rect.center(), vec2(w, h));
     let body = Color32::from_rgb(0x7f, 0x8c, 0x8d);
     p.rect_filled(r, s * 0.1, body);
-    p.rect_stroke(r, s * 0.1, Stroke::new(1.0, darken(body, 0.7)));
+    p.rect_stroke(r, s * 0.1, Stroke::new(1.0_f32, darken(body, 0.7)));
     p.circle_filled(
         pos2(r.right() - h * 0.35, r.center().y),
         (s * 0.06).max(1.5),
@@ -217,7 +217,7 @@ pub fn paint_drive(p: &Painter, rect: Rect) {
             pos2(r.left() + w * 0.15, r.center().y),
             pos2(r.left() + w * 0.55, r.center().y),
         ],
-        Stroke::new(1.0, lighten(body, 0.4)),
+        Stroke::new(1.0_f32, lighten(body, 0.4)),
     );
 }
 
@@ -260,7 +260,7 @@ fn arc(c: Pos2, r: f32, a0: f32, a1: f32) -> Vec<Pos2> {
 
 pub fn paint_tool(p: &Painter, rect: Rect, t: Tool, col: Color32) {
     let c = rect.center();
-    let s = Stroke::new(1.6, col);
+    let s = Stroke::new(1.6_f32, col);
     let line = |pts: Vec<Pos2>| {
         p.add(Shape::line(pts, s));
     };
@@ -441,12 +441,12 @@ pub fn tool_button_sized(
         if selected {
             ui.painter().rect_filled(rect, 4.0, v.selection.bg_fill);
             ui.painter()
-                .rect_stroke(rect, 4.0, Stroke::new(1.0, accent));
+                .rect_stroke(rect, 4.0, Stroke::new(1.0_f32, accent));
         } else if enabled && resp.hovered() {
             ui.painter()
                 .rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
             ui.painter()
-                .rect_stroke(rect, 4.0, Stroke::new(1.0, accent));
+                .rect_stroke(rect, 4.0, Stroke::new(1.0_f32, accent));
         }
         let col = if enabled {
             v.text_color()

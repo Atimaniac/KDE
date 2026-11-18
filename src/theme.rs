@@ -77,8 +77,8 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     v.code_bg_color = p.header;
     v.hyperlink_color = p.accent;
     v.selection.bg_fill = p.select;
-    v.selection.stroke = Stroke::new(1.0, p.accent);
-    v.window_stroke = Stroke::new(1.0, p.border);
+    v.selection.stroke = Stroke::new(1.0_f32, p.accent);
+    v.window_stroke = Stroke::new(1.0_f32, p.border);
     v.window_rounding = Rounding::same(6.0);
     v.menu_rounding = Rounding::same(6.0);
 
@@ -86,20 +86,20 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.window;
     w.noninteractive.weak_bg_fill = p.window;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.inactive.bg_fill = button;
     w.inactive.weak_bg_fill = button;
-    w.inactive.bg_stroke = Stroke::new(1.0, p.border);
-    w.inactive.fg_stroke = Stroke::new(1.0, p.text);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
     w.hovered.bg_fill = p.hover;
     w.hovered.weak_bg_fill = p.hover;
-    w.hovered.bg_stroke = Stroke::new(1.0, p.accent);
-    w.hovered.fg_stroke = Stroke::new(1.5, p.text);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, p.accent);
+    w.hovered.fg_stroke = Stroke::new(1.5_f32, p.text);
     w.active.bg_fill = p.select;
     w.active.weak_bg_fill = p.select;
-    w.active.bg_stroke = Stroke::new(1.0, p.accent);
-    w.active.fg_stroke = Stroke::new(1.5, p.text);
+    w.active.bg_stroke = Stroke::new(1.0_f32, p.accent);
+    w.active.fg_stroke = Stroke::new(1.5_f32, p.text);
     w.open = w.active;
     for wv in [
         &mut w.noninteractive,

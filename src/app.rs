@@ -1018,7 +1018,7 @@ impl App {
                 Frame::none()
                     .fill(pal.view)
                     .stroke(Stroke::new(
-                        1.0,
+                        1.0_f32,
                         if editing { pal.accent } else { pal.border },
                     ))
                     .rounding(4.0)
@@ -1840,7 +1840,7 @@ fn chevron(ui: &mut Ui, col: Color32) {
             c + vec2(2.0, 0.0),
             c + vec2(-2.0, 4.0),
         ],
-        Stroke::new(1.2, col),
+        Stroke::new(1.2_f32, col),
     ));
 }
 
@@ -1870,7 +1870,7 @@ fn place_row(
         let p = ui.painter();
         if active {
             p.rect_filled(rect, 4.0, pal.select);
-            p.rect_stroke(rect, 4.0, Stroke::new(1.0, pal.accent));
+            p.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, pal.accent));
         } else if resp.hovered() {
             p.rect_filled(rect, 4.0, pal.hover);
         }
@@ -1939,10 +1939,10 @@ fn handle_place(
 fn paint_item_bg(p: &egui::Painter, rect: Rect, selected: bool, hovered: bool, pal: &Palette) {
     if selected {
         p.rect_filled(rect, 4.0, pal.select);
-        p.rect_stroke(rect, 4.0, Stroke::new(1.0, pal.accent));
+        p.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, pal.accent));
     } else if hovered {
         p.rect_filled(rect, 4.0, pal.hover);
-        p.rect_stroke(rect, 4.0, Stroke::new(1.0, pal.accent.gamma_multiply(0.6)));
+        p.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.6)));
     }
 }
 
@@ -2106,7 +2106,7 @@ fn pane_view(
     if highlight {
         ui.painter().line_segment(
             [full.left_top(), full.right_top()],
-            Stroke::new(2.0, pal.accent),
+            Stroke::new(2.0_f32, pal.accent),
         );
     }
 
@@ -2304,7 +2304,7 @@ fn details_view(
                     r.left_top() + vec2(0.0, 4.0),
                     r.left_bottom() - vec2(0.0, 4.0),
                 ],
-                Stroke::new(1.0, pal.border),
+                Stroke::new(1.0_f32, pal.border),
             );
         }
         let right = *k == SortBy::Size;
@@ -2354,7 +2354,7 @@ fn details_view(
     }
     ui.painter().line_segment(
         [hrect.left_bottom(), hrect.right_bottom()],
-        Stroke::new(1.0, pal.border),
+        Stroke::new(1.0_f32, pal.border),
     );
 
     // Rows
