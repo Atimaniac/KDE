@@ -9,20 +9,27 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
 `delfin.exe --shell` runs:
 
 - **Panel** at the bottom: launcher button, pinned file manager + terminal, task list with real
-  window icons (click = switch / minimize, middle click = close), a Wi-Fi / volume button showing the real signal and volume,
-  clock, *show desktop* strip. Maximized windows don't cover it.
-- **Launcher** (Kickoff-like): all Start Menu apps and Store apps with search. Enter runs the first match, or the
-  typed text as a command (like the Run dialog). Lock / Log Out / Restart / Shut Down (click twice).
-- **Quick Settings** (click the Wi-Fi / volume button; right-click opens Sound settings): volume and
-  mute, monitor brightness (DDC/CI monitors and laptop screens), play / pause / next / previous,
-  Wi-Fi on/off and a list of networks to connect to (with a password) or disconnect, battery level
-  on laptops, shortcuts to Windows Settings.
+  window icons (click = switch / minimize, middle click = close), separate network and volume
+  buttons showing the real Wi-Fi signal and volume (mouse wheel over the speaker changes the
+  volume), and a clock that opens a month calendar. Maximized windows don't cover it.
+- **Launcher**: a search box; the list stays empty until you type or pick a category on the left
+  (Office, Graphics, Internet, Multimedia, System Tools, Games, Recently Used, All Applications).
+  Start Menu apps and Store apps, with descriptions. Enter runs the selected app, or the typed text
+  as a command (like the Run dialog). On the right: This PC, Documents, Downloads, Settings, Task
+  Manager, Run, **Delfin** settings, and Lock / Shut Down / Restart / Log Out (click twice).
+- **Delfin settings** (launcher → *Delfin*): English or Polish, updates from the latest GitHub
+  release (checked against the SHA-256 in its notes, installed in place, then a restart), and the
+  shell options *Minimize to tray* and *Back to Explorer*.
+- **Flyouts**: the volume button opens volume and mute, monitor brightness (DDC/CI monitors and
+  laptop screens), play / pause / next / previous and the battery level on laptops; the network
+  button opens Wi-Fi on/off and a list of networks to connect to (with a password) or disconnect.
+  Right-click either one for the matching Windows Settings page.
 - **Desktop**: your Windows wallpaper, Desktop folder icons (double-click to open), right-click menu.
-- **System tray** (notification area) that works like Explorer's: programs such as Steam,
+- **System tray** (notification area) (takes over as soon as Explorer is closed, also while the shell runs) that works like Explorer's: programs such as Steam,
   Discord or OneDrive show their icons, can hide to the tray when minimized, and get left / right /
   double / middle clicks and their context menus. Tooltips, balloon notifications and a **^**
   overflow for icons beyond 8. Already-running programs re-add their icons when the shell starts.
-- **Minimize to tray** (optional, launcher → *Minimize to tray*): any minimized window is hidden
+- **Minimize to tray** (optional, Delfin settings → *Minimize to tray*): any minimized window is hidden
   into the tray (blue underline); click it to bring it back.
 - **Startup apps** from the registry *Run* keys and Startup folders (disabled entries in Task
   Manager are respected).
@@ -35,7 +42,7 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
 taskkill /f /im explorer.exe
 target\release\delfin.exe --shell
 ```
-To get Explorer back: launcher → *Back to Explorer*, or Ctrl+Alt+Del → Task Manager →
+To get Explorer back: Delfin settings → *Back to Explorer*, or Ctrl+Alt+Del → Task Manager →
 *Run new task* → `explorer.exe`.
 
 ### Install as your shell
@@ -44,7 +51,7 @@ Delfin menu (☰) → *System* → **Use Delfin as Windows shell…**, or `delfi
 Then sign out and back in. It's per user (HKCU, no admin). The exe is copied to
 `%LOCALAPPDATA%\Programs\Delfin\delfin.exe`.
 
-**Go back:** launcher → *Back to Explorer* (click twice), or `delfin.exe --uninstall-shell`.
+**Go back:** Delfin settings → *Back to Explorer* (click twice), or `delfin.exe --uninstall-shell`.
 Emergency (black screen): Ctrl+Alt+Del → Task Manager → *Run new task* → `explorer.exe`,
 then run `%LOCALAPPDATA%\Programs\Delfin\delfin.exe --uninstall-shell`.
 

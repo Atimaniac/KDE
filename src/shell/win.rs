@@ -172,6 +172,22 @@ pub fn is_window(h: isize) -> bool {
     unsafe { IsWindow(h as HWND) != 0 }
 }
 
+/// Height in pixels of Explorer's taskbar if Explorer is running, else 0.
+pub fn explorer_taskbar_px(own_pid: u32) -> i32 {
+    let Some(h) = find_class("Shell_TrayWnd") else { return 0 };
+    if pid_of(h) == own_pid {
+        return 0; // that's our own tray window
+    }
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(h as HWND, &mut r) };
+    let (_, screen_h) = screen_px();
+    if r.bottom >= screen_h && r.top > screen_h / 2 {
+        r.bottom - r.top
+    } else {
+        0
+    }
+}
+
 pub fn find_class(class: &str) -> Option<isize> {
     let w = wide(class);
     let h = unsafe { FindWindowW(w.as_ptr(), null()) };
@@ -182,6 +198,29 @@ pub fn find_window(title: &str) -> Option<isize> {
     let w = wide(title);
     let h = unsafe { FindWindowW(null(), w.as_ptr()) };
     (!h.is_null()).then_some(h as isize)
+}
+
+/// Show one of our pop-up windows (launcher, flyouts, tooltips) that egui
+/// created hidden. Marking it a tool window *before* it first appears keeps
+/// Windows from flashing a taskbar button for it. Returns false while the
+/// window doesn't exist yet.
+pub fn reveal_popup(title: &str, activate: bool) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
+    let Some(h) = find_window(title) else { return false };
+    let hw = h as HWND;
+    unsafe {
+        if IsWindowVisible(hw) != 0 {
+            return true;
+        }
+        let ex = GetWindowLongPtrW(hw, -20 /* GWL_EXSTYLE */);
+        let ex = (ex | 0x80 /* WS_EX_TOOLWINDOW */) & !0x4_0000 /* WS_EX_APPWINDOW */;
+        SetWindowLongPtrW(hw, -20, ex);
+        ShowWindow(hw, if activate { 5 /* SW_SHOW */ } else { 4 /* SW_SHOWNOACTIVATE */ });
+        if activate {
+            SetForegroundWindow(hw);
+        }
+    }
+    true
 }
 
 pub fn set_shell_window(h: isize) {
@@ -432,6 +471,22 @@ pub fn spawn_self(arg: Option<&Path>) {
         }
         let _ = c.spawn();
     }
+}
+
+/// Open a file, folder, shortcut, URL or `ms-settings:` page like a double-click.
+/// Runs on its own thread: ShellExecute can take a moment (or wait on a slow
+/// handler), and the panel must never freeze while it does. Unlike the `open`
+/// crate it never starts PowerShell or falls back to explorer.exe.
+pub fn shell_open(target: impl AsRef<std::ffi::OsStr>) {
+    let w = wide(target.as_ref());
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::System::Com::CoInitializeEx;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        // Apartment-threaded, no OLE1 DDE: what ShellExecute expects.
+        CoInitializeEx(null(), 0x2 | 0x4);
+        let verb = wide("open");
+        ShellExecuteW(null_mut(), verb.as_ptr(), w.as_ptr(), null(), null(), 1 /* SW_SHOWNORMAL */);
+    });
 }
 
 /// Run a command line the way the Run dialog does (`start "" <cmd>`).

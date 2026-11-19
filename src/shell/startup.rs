@@ -53,7 +53,7 @@ fn run_folder(dir: &Path) {
         if name.eq_ignore_ascii_case("desktop.ini") || disabled("StartupFolder", &name) {
             continue;
         }
-        let _ = open::that(e.path());
+        super::win::shell_open(e.path());
     }
 }
 

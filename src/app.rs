@@ -322,13 +322,13 @@ pub struct App {
 
 fn default_places() -> Vec<(&'static str, PathBuf)> {
     let candidates = [
-        ("Home", dirs::home_dir()),
-        ("Desktop", dirs::desktop_dir()),
-        ("Documents", dirs::document_dir()),
-        ("Downloads", dirs::download_dir()),
-        ("Music", dirs::audio_dir()),
-        ("Pictures", dirs::picture_dir()),
-        ("Videos", dirs::video_dir()),
+        (crate::i18n::tr("Home"), dirs::home_dir()),
+        (crate::i18n::tr("Desktop"), dirs::desktop_dir()),
+        (crate::i18n::tr("Documents"), dirs::document_dir()),
+        (crate::i18n::tr("Downloads"), dirs::download_dir()),
+        (crate::i18n::tr("Music"), dirs::audio_dir()),
+        (crate::i18n::tr("Pictures"), dirs::picture_dir()),
+        (crate::i18n::tr("Videos"), dirs::video_dir()),
     ];
     let mut v: Vec<(&'static str, PathBuf)> = Vec::new();
     for (name, path) in candidates {
@@ -543,7 +543,7 @@ impl App {
                 self.err(e);
             }
         } else {
-            self.err(format!("Location not found: {s}"));
+            self.err(crate::i18n::trf("Location not found: {}", &[&s]));
         }
     }
 
@@ -595,7 +595,7 @@ impl App {
                 self.clip = Some(Clip { paths, cut });
                 self.info(format!(
                     "{} {n} item(s)",
-                    if cut { "Cut" } else { "Copied" }
+                    if cut { crate::i18n::tr("Cut") } else { crate::i18n::tr("Copied") }
                 ));
             }
             Action::Paste => self.paste(ctx),
@@ -634,7 +634,7 @@ impl App {
                     let n = sel.len();
                     self.spawn(ctx, move || {
                         trash::delete_all(&sel)
-                            .map(|_| format!("Moved {n} item(s) to Trash"))
+                            .map(|_| crate::i18n::trf("Moved {} item(s) to Trash", &[&n]))
                             .map_err(|e| e.to_string())
                     });
                 }
@@ -649,7 +649,7 @@ impl App {
                 let dir = self.pane().cwd.clone();
                 self.dialog = Dialog::NewFolder {
                     dir,
-                    text: "New Folder".into(),
+                    text: crate::i18n::tr("New Folder").into(),
                     focus: true,
                 };
             }
@@ -664,7 +664,7 @@ impl App {
                         .join("\n")
                 };
                 ctx.output_mut(|o| o.copied_text = text);
-                self.info("Location copied");
+                self.info(crate::i18n::tr("Location copied"));
             }
             Action::Terminal(p) => {
                 if let Err(e) = platform::open_terminal(&p) {
@@ -697,8 +697,8 @@ impl App {
             }
             Action::ShowInfo => self.cfg.info_panel = true,
             Action::FolderHandler(on) => match platform::set_folder_handler(on) {
-                Ok(()) if on => self.info("Folders now open in Delfin"),
-                Ok(()) => self.info("Folders open in Windows Explorer again"),
+                Ok(()) if on => self.info(crate::i18n::tr("Folders now open in Delfin")),
+                Ok(()) => self.info(crate::i18n::tr("Folders open in Windows Explorer again")),
                 Err(e) => self.err(e),
             },
             Action::SelectAll => self.with_pane(|p, _| {
@@ -919,18 +919,18 @@ impl App {
                         let p = self.pane();
                         (p.can_back(), p.can_forward(), p.cwd.parent().is_some())
                     };
-                    if icons::tool_button(ui, Tool::Back, false, cb, "Back (Alt+Left)").clicked() {
+                    if icons::tool_button(ui, Tool::Back, false, cb, crate::i18n::tr("Back (Alt+Left)")).clicked() {
                         self.with_pane(|p, c| p.back(c));
                     }
-                    if icons::tool_button(ui, Tool::Forward, false, cf, "Forward (Alt+Right)")
+                    if icons::tool_button(ui, Tool::Forward, false, cf, crate::i18n::tr("Forward (Alt+Right)"))
                         .clicked()
                     {
                         self.with_pane(|p, c| p.forward(c));
                     }
-                    if icons::tool_button(ui, Tool::Up, false, cu, "Up (Alt+Up)").clicked() {
+                    if icons::tool_button(ui, Tool::Up, false, cu, crate::i18n::tr("Up (Alt+Up)")).clicked() {
                         self.with_pane(|p, c| p.up(c));
                     }
-                    if icons::tool_button(ui, Tool::Home, false, true, "Home (Alt+Home)").clicked()
+                    if icons::tool_button(ui, Tool::Home, false, true, crate::i18n::tr("Home (Alt+Home)")).clicked()
                     {
                         if let Some(h) = dirs::home_dir() {
                             self.with_pane(|p, c| p.navigate(h, c));
@@ -944,7 +944,7 @@ impl App {
                         let r = self.with_pane(|p, _| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut p.filter)
-                                    .hint_text("Filter…")
+                                    .hint_text(crate::i18n::tr("Filter…"))
                                     .desired_width(170.0),
                             )
                         });
@@ -971,7 +971,7 @@ impl App {
 
                         ui.separator();
                         let split = self.tabs[self.cur].panes.len() > 1;
-                        if icons::tool_button(ui, Tool::Split, split, true, "Split view (F3)")
+                        if icons::tool_button(ui, Tool::Split, split, true, crate::i18n::tr("Split view (F3)"))
                             .clicked()
                         {
                             self.toggle_split();
@@ -981,7 +981,7 @@ impl App {
                             Tool::Info,
                             self.cfg.info_panel,
                             true,
-                            "Information panel (F11)",
+                            crate::i18n::tr("Information panel (F11)"),
                         )
                         .clicked()
                         {
@@ -989,9 +989,9 @@ impl App {
                         }
                         ui.separator();
                         for (t, m, tip) in [
-                            (Tool::Details, ViewMode::Details, "Details view (Ctrl+3)"),
-                            (Tool::Compact, ViewMode::Compact, "Compact view (Ctrl+2)"),
-                            (Tool::Icons, ViewMode::Icons, "Icons view (Ctrl+1)"),
+                            (Tool::Details, ViewMode::Details, crate::i18n::tr("Details view (Ctrl+3)")),
+                            (Tool::Compact, ViewMode::Compact, crate::i18n::tr("Compact view (Ctrl+2)")),
+                            (Tool::Icons, ViewMode::Icons, crate::i18n::tr("Icons view (Ctrl+1)")),
                         ] {
                             if icons::tool_button(ui, t, self.cfg.view == m, true, tip).clicked() {
                                 self.cfg.view = m;
@@ -1105,7 +1105,7 @@ impl App {
     }
 
     fn main_menu(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let resp = icons::tool_button(ui, Tool::Menu, false, true, "Menu");
+        let resp = icons::tool_button(ui, Tool::Menu, false, true, crate::i18n::tr("Menu"));
         let id = ui.make_persistent_id("main_menu");
         if resp.clicked() {
             ui.memory_mut(|m| m.toggle_popup(id));
@@ -1119,34 +1119,34 @@ impl App {
             |ui| {
                 ui.set_min_width(240.0);
                 if ui
-                    .checkbox(&mut self.cfg.show_hidden, "Show hidden files  (Ctrl+H)")
+                    .checkbox(&mut self.cfg.show_hidden, crate::i18n::tr("Show hidden files  (Ctrl+H)"))
                     .changed()
                 {
                     acts.push(Action::Refilter);
                 }
-                ui.checkbox(&mut self.cfg.places_panel, "Places panel  (F9)");
-                ui.checkbox(&mut self.cfg.info_panel, "Information panel  (F11)");
+                ui.checkbox(&mut self.cfg.places_panel, crate::i18n::tr("Places panel  (F9)"));
+                ui.checkbox(&mut self.cfg.info_panel, crate::i18n::tr("Information panel  (F11)"));
                 if ui
-                    .checkbox(&mut self.cfg.folders_first, "Folders first")
+                    .checkbox(&mut self.cfg.folders_first, crate::i18n::tr("Folders first"))
                     .changed()
                 {
                     acts.push(Action::Refilter);
                 }
-                ui.checkbox(&mut self.cfg.dark, "Breeze Dark theme");
+                ui.checkbox(&mut self.cfg.dark, crate::i18n::tr("Breeze Dark theme"));
                 ui.separator();
-                ui.label(RichText::new("Sort by").weak());
+                ui.label(RichText::new(crate::i18n::tr("Sort by")).weak());
                 for (k, n) in [
-                    (SortBy::Name, "Name"),
-                    (SortBy::Size, "Size"),
-                    (SortBy::Modified, "Modified"),
-                    (SortBy::Type, "Type"),
+                    (SortBy::Name, crate::i18n::tr("Name")),
+                    (SortBy::Size, crate::i18n::tr("Size")),
+                    (SortBy::Modified, crate::i18n::tr("Modified")),
+                    (SortBy::Type, crate::i18n::tr("Type")),
                 ] {
                     if ui.radio(self.cfg.sort == k, n).clicked() {
                         self.cfg.sort = k;
                         acts.push(Action::Refilter);
                     }
                 }
-                if ui.checkbox(&mut self.cfg.sort_asc, "Ascending").changed() {
+                if ui.checkbox(&mut self.cfg.sort_asc, crate::i18n::tr("Ascending")).changed() {
                     acts.push(Action::Refilter);
                 }
                 ui.separator();
@@ -1157,30 +1157,30 @@ impl App {
                     }
                 };
                 let cwd = self.pane().cwd.clone();
-                item(ui, "New Tab", "Ctrl+T", Action::NewTab(cwd.clone()));
-                item(ui, "New Folder…", "Ctrl+Shift+N", Action::NewFolder);
+                item(ui, crate::i18n::tr("New Tab"), "Ctrl+T", Action::NewTab(cwd.clone()));
+                item(ui, crate::i18n::tr("New Folder…"), "Ctrl+Shift+N", Action::NewFolder);
                 item(
                     ui,
-                    "Open Terminal Here",
+                    crate::i18n::tr("Open Terminal Here"),
                     "F4",
                     Action::Terminal(cwd.clone()),
                 );
-                item(ui, "Add Folder to Places", "", Action::AddPlace(cwd));
-                item(ui, "Refresh", "F5", Action::Refresh);
+                item(ui, crate::i18n::tr("Add Folder to Places"), "", Action::AddPlace(cwd));
+                item(ui, crate::i18n::tr("Refresh"), "F5", Action::Refresh);
                 ui.separator();
-                ui.label(RichText::new("System").weak());
+                ui.label(RichText::new(crate::i18n::tr("System")).weak());
                 let mut handler = platform::folder_handler_set();
                 if ui
-                    .checkbox(&mut handler, "Open folders in Delfin by default")
+                    .checkbox(&mut handler, crate::i18n::tr("Open folders in Delfin by default"))
                     .changed()
                 {
                     acts.push(Action::FolderHandler(handler));
                 }
                 let installed = platform::shell_installed();
                 let label = if installed {
-                    "Restore Windows Explorer as shell…"
+                    crate::i18n::tr("Restore Windows Explorer as shell…")
                 } else {
-                    "Use Delfin as Windows shell…"
+                    crate::i18n::tr("Use Delfin as Windows shell…")
                 };
                 if ui.button(label).clicked() {
                     self.dialog = Dialog::Shell {
@@ -1189,7 +1189,7 @@ impl App {
                     ui.memory_mut(|m| m.close_popup());
                 }
                 ui.separator();
-                if ui.button("About Delfin").clicked() {
+                if ui.button(crate::i18n::tr("About Delfin")).clicked() {
                     self.dialog = Dialog::About;
                     ui.memory_mut(|m| m.close_popup());
                 }
@@ -1226,7 +1226,7 @@ impl App {
                             Tool::Close,
                             false,
                             true,
-                            "Close tab (Ctrl+W)",
+                            crate::i18n::tr("Close tab (Ctrl+W)"),
                             vec2(20.0, 20.0),
                         )
                         .clicked()
@@ -1235,7 +1235,7 @@ impl App {
                         }
                         ui.add_space(6.0);
                     }
-                    if icons::tool_button(ui, Tool::Plus, false, true, "New tab (Ctrl+T)").clicked()
+                    if icons::tool_button(ui, Tool::Plus, false, true, crate::i18n::tr("New tab (Ctrl+T)")).clicked()
                     {
                         add = true;
                     }
@@ -1279,15 +1279,15 @@ impl App {
                         }
                     }
                     let text = if sn > 0 {
-                        format!("{sn} selected ({})", fsops::fmt_size(ssz))
+                        crate::i18n::trf("{} selected ({})", &[&sn, &fsops::fmt_size(ssz)])
                     } else {
-                        format!("{nd} folders, {nf} files ({})", fsops::fmt_size(sz))
+                        crate::i18n::trf("{} folders, {} files ({})", &[&nd, &nf, &fsops::fmt_size(sz)])
                     };
                     let space = p.space;
                     ui.label(text);
                     if self.jobs > 0 {
                         ui.spinner();
-                        ui.label("Working…");
+                        ui.label(crate::i18n::tr("Working…"));
                     }
                     if let Some((msg, t, is_err)) = &self.toast {
                         if t.elapsed() < Duration::from_secs(5) {
@@ -1303,15 +1303,15 @@ impl App {
                             egui::Slider::new(&mut self.cfg.icon_size, 24.0..=160.0)
                                 .show_value(false),
                         )
-                        .on_hover_text("Zoom (Ctrl+mouse wheel)");
-                        ui.label(RichText::new("Zoom").color(pal.dim));
+                        .on_hover_text(crate::i18n::tr("Zoom (Ctrl+mouse wheel)"));
+                        ui.label(RichText::new(crate::i18n::tr("Zoom")).color(pal.dim));
                         if let Some((free, total)) = space {
                             if total > 0 {
                                 let used = 1.0 - free as f32 / total as f32;
                                 ui.add(
                                     egui::ProgressBar::new(used)
                                         .desired_width(160.0)
-                                        .text(format!("{} free", fsops::fmt_size(free))),
+                                        .text(crate::i18n::trf("{} free", &[&fsops::fmt_size(free)])),
                                 );
                             }
                         }
@@ -1344,7 +1344,7 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         let cwd = self.pane().cwd.clone();
 
-                        section(ui, "Places", pal);
+                        section(ui, crate::i18n::tr("Places"), pal);
                         for (name, path) in &self.places {
                             let r = place_row(ui, PlaceIcon::Folder, name, cwd == *path, None, pal);
                             handle_place(&r, path, false, &mut nav, &mut newtab, &mut remove);
@@ -1362,7 +1362,7 @@ impl App {
                         }
 
                         ui.add_space(8.0);
-                        section(ui, "Devices", pal);
+                        section(ui, crate::i18n::tr("Devices"), pal);
                         for d in &self.drives {
                             let cap = (d.total > 0).then(|| 1.0 - d.free as f32 / d.total as f32);
                             let r =
@@ -1439,7 +1439,7 @@ impl App {
                                 &sel[0].ext,
                                 pal,
                             );
-                            format!("{n} items selected")
+                            crate::i18n::trf("{} items selected", &[&n])
                         }
                     };
                     ui.add_space(8.0);
@@ -1456,36 +1456,36 @@ impl App {
                     0 => {
                         let nd = p.visible.iter().filter(|&&i| p.entries[i].is_dir).count();
                         let nf = p.visible.len() - nd;
-                        field(ui, "Type", "Folder".into());
-                        field(ui, "Contents", format!("{nd} folders, {nf} files"));
-                        field(ui, "Location", p.cwd.display().to_string());
+                        field(ui, crate::i18n::tr("Type"), crate::i18n::tr("Folder").into());
+                        field(ui, crate::i18n::tr("Contents"), crate::i18n::trf("{} folders, {} files", &[&nd, &nf]));
+                        field(ui, crate::i18n::tr("Location"), p.cwd.display().to_string());
                     }
                     1 => {
                         let e = sel[0];
-                        field(ui, "Type", icons::type_name(&e.ext, e.is_dir));
+                        field(ui, crate::i18n::tr("Type"), icons::type_name(&e.ext, e.is_dir));
                         if !e.is_dir {
                             field(
                                 ui,
-                                "Size",
+                                crate::i18n::tr("Size"),
                                 format!("{} ({} bytes)", fsops::fmt_size(e.size), e.size),
                             );
                         }
-                        field(ui, "Modified", fsops::fmt_time(e.modified));
+                        field(ui, crate::i18n::tr("Modified"), fsops::fmt_time(e.modified));
                         field(
                             ui,
-                            "Location",
+                            crate::i18n::tr("Location"),
                             e.path
                                 .parent()
                                 .map(|x| x.display().to_string())
                                 .unwrap_or_default(),
                         );
                         if e.hidden {
-                            field(ui, "Attributes", "Hidden".into());
+                            field(ui, crate::i18n::tr("Attributes"), crate::i18n::tr("Hidden").into());
                         }
                     }
                     _ => {
                         let total: u64 = sel.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
-                        field(ui, "Total size of files", fsops::fmt_size(total));
+                        field(ui, crate::i18n::tr("Total size of files"), fsops::fmt_size(total));
                     }
                 }
             });
@@ -1553,10 +1553,10 @@ impl App {
         match &mut self.dialog {
             Dialog::None => return,
             Dialog::Rename { path, text, focus } => {
-                window("Rename").show(ctx, |ui| {
-                    ui.label(format!(
+                window(crate::i18n::tr("Rename")).show(ctx, |ui| {
+                    ui.label(crate::i18n::trf(
                         "New name for \u{201c}{}\u{201d}:",
-                        display_name(path)
+                        &[&display_name(path)],
                     ));
                     // Pre-select the name without the extension, like Dolphin.
                     let sel_len = if path.is_dir() {
@@ -1585,19 +1585,19 @@ impl App {
                         out.response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Rename").clicked() || enter {
+                        if ui.button(crate::i18n::tr("Rename")).clicked() || enter {
                             result = Some(DialogResult::Rename(path.clone(), text.clone()));
                             close = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(crate::i18n::tr("Cancel")).clicked() {
                             close = true;
                         }
                     });
                 });
             }
             Dialog::NewFolder { dir, text, focus } => {
-                window("Create New Folder").show(ctx, |ui| {
-                    ui.label(format!("Create new folder in {}:", dir.display()));
+                window(crate::i18n::tr("Create New Folder")).show(ctx, |ui| {
+                    ui.label(crate::i18n::trf("Create new folder in {}:", &[&dir.display()]));
                     let mut out = egui::TextEdit::singleline(&mut *text)
                         .desired_width(340.0)
                         .show(ui);
@@ -1621,37 +1621,34 @@ impl App {
                             result = Some(DialogResult::NewFolder(dir.clone(), text.clone()));
                             close = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(crate::i18n::tr("Cancel")).clicked() {
                             close = true;
                         }
                     });
                 });
             }
             Dialog::ConfirmDelete { paths } => {
-                window("Delete Permanently").show(ctx, |ui| {
-                    ui.label(format!(
-                        "Permanently delete {} item(s)? This cannot be undone.",
-                        paths.len()
-                    ));
+                window(crate::i18n::tr("Delete Permanently")).show(ctx, |ui| {
+                    ui.label(crate::i18n::trf("Permanently delete {} item(s)? This cannot be undone.", &[&paths.len()]));
                     for p in paths.iter().take(6) {
                         ui.label(RichText::new(format!("  • {}", display_name(p))).color(pal.dim));
                     }
                     if paths.len() > 6 {
                         ui.label(
-                            RichText::new(format!("  … and {} more", paths.len() - 6))
+                            RichText::new(crate::i18n::trf("  … and {} more", &[&(paths.len() - 6)]))
                                 .color(pal.dim),
                         );
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .button(RichText::new("Delete").color(pal.danger))
+                            .button(RichText::new(crate::i18n::tr("Delete")).color(pal.danger))
                             .clicked()
                         {
                             result = Some(DialogResult::Delete(paths.clone()));
                             close = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(crate::i18n::tr("Cancel")).clicked() {
                             close = true;
                         }
                     });
@@ -1660,9 +1657,9 @@ impl App {
             Dialog::Shell { install } => {
                 let install = *install;
                 let title = if install {
-                    "Use Delfin as Windows Shell"
+                    crate::i18n::tr("Use Delfin as Windows Shell")
                 } else {
-                    "Restore Windows Explorer"
+                    crate::i18n::tr("Restore Windows Explorer")
                 };
                 window(title).show(ctx, |ui| {
                     ui.set_max_width(440.0);
@@ -1673,9 +1670,9 @@ impl App {
                              Delfin as the folder window.",
                         );
                         ui.add_space(6.0);
-                        ui.label("It takes effect after you sign out and sign back in. No admin rights needed.");
+                        ui.label(crate::i18n::tr("It takes effect after you sign out and sign back in. No admin rights needed."));
                         ui.add_space(6.0);
-                        ui.label(RichText::new("How to go back:").strong());
+                        ui.label(RichText::new(crate::i18n::tr("How to go back:")).strong());
                         ui.label("• Launcher → \"Back to Explorer\" (click twice)");
                         ui.label(
                             "• Emergency: Ctrl+Alt+Del → Task Manager → Run new task → explorer.exe, \
@@ -1690,27 +1687,27 @@ impl App {
                             .color(pal.dim),
                         );
                     } else {
-                        ui.label("Windows Explorer will be your shell again after you sign out and back in.");
+                        ui.label(crate::i18n::tr("Windows Explorer will be your shell again after you sign out and back in."));
                     }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let ok = if install { "Use Delfin as shell" } else { "Restore Explorer" };
+                        let ok = if install { crate::i18n::tr("Use Delfin as shell") } else { crate::i18n::tr("Restore Explorer") };
                         if ui.button(RichText::new(ok).strong()).clicked() {
                             result = Some(DialogResult::Shell(install));
                             close = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(crate::i18n::tr("Cancel")).clicked() {
                             close = true;
                         }
                     });
                 });
             }
             Dialog::About => {
-                window("About Delfin").show(ctx, |ui| {
+                window(crate::i18n::tr("About Delfin")).show(ctx, |ui| {
                     ui.label(RichText::new("Delfin 0.1").strong().size(16.0));
                     ui.label("A KDE Dolphin-style file manager written in Rust + egui.");
                     ui.add_space(6.0);
-                    if ui.button("Close").clicked() {
+                    if ui.button(crate::i18n::tr("Close")).clicked() {
                         close = true;
                     }
                 });
@@ -1727,7 +1724,7 @@ impl App {
             Some(DialogResult::Rename(path, name)) => {
                 let name = name.trim().to_string();
                 if name.is_empty() || name.contains(|c: char| c == '/' || c == '\\') {
-                    self.err("Invalid name");
+                    self.err(crate::i18n::tr("Invalid name"));
                     return;
                 }
                 let new = path.with_file_name(&name);
@@ -1737,7 +1734,7 @@ impl App {
                 let only_case =
                     new.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
                 if new.exists() && !only_case {
-                    self.err("An item with that name already exists");
+                    self.err(crate::i18n::tr("An item with that name already exists"));
                     return;
                 }
                 match std::fs::rename(&path, &new) {
@@ -1745,13 +1742,13 @@ impl App {
                         self.reload_all();
                         self.select_path(&new);
                     }
-                    Err(e) => self.err(format!("Rename failed: {e}")),
+                    Err(e) => self.err(crate::i18n::trf("Rename failed: {}", &[&e])),
                 }
             }
             Some(DialogResult::NewFolder(dir, name)) => {
                 let name = name.trim().to_string();
                 if name.is_empty() || name.contains(|c: char| c == '/' || c == '\\') {
-                    self.err("Invalid name");
+                    self.err(crate::i18n::tr("Invalid name"));
                     return;
                 }
                 let target = dir.join(&name);
@@ -1760,7 +1757,7 @@ impl App {
                         self.reload_all();
                         self.select_path(&target);
                     }
-                    Err(e) => self.err(format!("Cannot create folder: {e}")),
+                    Err(e) => self.err(crate::i18n::trf("Cannot create folder: {}", &[&e])),
                 }
             }
             Some(DialogResult::Shell(install)) => {
@@ -1772,9 +1769,9 @@ impl App {
                 match r {
                     Ok(msg) => {
                         self.info(if install {
-                            "Delfin set as shell. Sign out and back in."
+                            crate::i18n::tr("Delfin set as shell. Sign out and back in.")
                         } else {
-                            "Explorer restored."
+                            crate::i18n::tr("Explorer restored.")
                         });
                         platform::message("Delfin", &msg);
                     }
@@ -1925,11 +1922,11 @@ fn handle_place(
         *newtab = Some(path.to_path_buf());
     }
     r.context_menu(|ui| {
-        if ui.button("Open in New Tab").clicked() {
+        if ui.button(crate::i18n::tr("Open in New Tab")).clicked() {
             *newtab = Some(path.to_path_buf());
             ui.close_menu();
         }
-        if removable && ui.button("Remove from Places").clicked() {
+        if removable && ui.button(crate::i18n::tr("Remove from Places")).clicked() {
             *remove = Some(path.to_path_buf());
             ui.close_menu();
         }
@@ -1984,55 +1981,55 @@ fn mi(ui: &mut Ui, label: &str, shortcut: &str) -> bool {
 
 fn item_menu(ui: &mut Ui, path: &Path, is_dir: bool, out: &mut PaneOut) {
     ui.set_min_width(230.0);
-    if mi(ui, "Open", "Enter") {
+    if mi(ui, crate::i18n::tr("Open"), "Enter") {
         out.actions.push(Action::OpenSelected);
     }
     if is_dir {
-        if mi(ui, "Open in New Tab", "Middle click") {
+        if mi(ui, crate::i18n::tr("Open in New Tab"), crate::i18n::tr("Middle click")) {
             out.actions.push(Action::NewTab(path.to_path_buf()));
         }
-        if mi(ui, "Open Terminal Here", "") {
+        if mi(ui, crate::i18n::tr("Open Terminal Here"), "") {
             out.actions.push(Action::Terminal(path.to_path_buf()));
         }
     }
     ui.separator();
-    if mi(ui, "Cut", "Ctrl+X") {
+    if mi(ui, crate::i18n::tr("Cut"), "Ctrl+X") {
         out.actions.push(Action::Cut);
     }
-    if mi(ui, "Copy", "Ctrl+C") {
+    if mi(ui, crate::i18n::tr("Copy"), "Ctrl+C") {
         out.actions.push(Action::Copy);
     }
-    if mi(ui, "Copy Location", "") {
+    if mi(ui, crate::i18n::tr("Copy Location"), "") {
         out.actions.push(Action::CopyPath);
     }
     ui.separator();
-    if mi(ui, "Rename…", "F2") {
+    if mi(ui, crate::i18n::tr("Rename…"), "F2") {
         out.actions.push(Action::Rename);
     }
-    if mi(ui, "Move to Trash", "Del") {
+    if mi(ui, crate::i18n::tr("Move to Trash"), "Del") {
         out.actions.push(Action::Trash);
     }
-    if mi(ui, "Delete", "Shift+Del") {
+    if mi(ui, crate::i18n::tr("Delete"), "Shift+Del") {
         out.actions.push(Action::Delete);
     }
     ui.separator();
-    if is_dir && mi(ui, "Add to Places", "") {
+    if is_dir && mi(ui, crate::i18n::tr("Add to Places"), "") {
         out.actions.push(Action::AddPlace(path.to_path_buf()));
     }
-    if mi(ui, "Properties", "F11") {
+    if mi(ui, crate::i18n::tr("Properties"), "F11") {
         out.actions.push(Action::ShowInfo);
     }
 }
 
 fn background_menu(ui: &mut Ui, cwd: &Path, cfg: &Config, can_paste: bool, out: &mut PaneOut) {
     ui.set_min_width(230.0);
-    if mi(ui, "Create New Folder…", "Ctrl+Shift+N") {
+    if mi(ui, crate::i18n::tr("Create New Folder…"), "Ctrl+Shift+N") {
         out.actions.push(Action::NewFolder);
     }
     if ui
         .add_enabled(
             can_paste,
-            egui::Button::new("Paste").shortcut_text("Ctrl+V"),
+            egui::Button::new(crate::i18n::tr("Paste")).shortcut_text("Ctrl+V"),
         )
         .clicked()
     {
@@ -2040,25 +2037,25 @@ fn background_menu(ui: &mut Ui, cwd: &Path, cfg: &Config, can_paste: bool, out: 
         ui.close_menu();
     }
     ui.separator();
-    if mi(ui, "Open Terminal Here", "F4") {
+    if mi(ui, crate::i18n::tr("Open Terminal Here"), "F4") {
         out.actions.push(Action::Terminal(cwd.to_path_buf()));
     }
-    if mi(ui, "Copy Location", "") {
+    if mi(ui, crate::i18n::tr("Copy Location"), "") {
         out.actions.push(Action::CopyPath);
     }
-    if mi(ui, "Add to Places", "") {
+    if mi(ui, crate::i18n::tr("Add to Places"), "") {
         out.actions.push(Action::AddPlace(cwd.to_path_buf()));
     }
     ui.separator();
     let mut hidden = cfg.show_hidden;
-    if ui.checkbox(&mut hidden, "Show Hidden Files").clicked() {
+    if ui.checkbox(&mut hidden, crate::i18n::tr("Show Hidden Files")).clicked() {
         out.actions.push(Action::ToggleHidden);
         ui.close_menu();
     }
-    if mi(ui, "Select All", "Ctrl+A") {
+    if mi(ui, crate::i18n::tr("Select All"), "Ctrl+A") {
         out.actions.push(Action::SelectAll);
     }
-    if mi(ui, "Refresh", "F5") {
+    if mi(ui, crate::i18n::tr("Refresh"), "F5") {
         out.actions.push(Action::Refresh);
     }
 }
@@ -2127,16 +2124,16 @@ fn pane_view(
             if let Some(err) = &pane.error {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        RichText::new(format!("Cannot open this folder:\n{err}")).color(pal.danger),
+                        RichText::new(crate::i18n::trf("Cannot open this folder:\n{}", &[&err])).color(pal.danger),
                     )
                 });
                 return;
             }
             if pane.visible.is_empty() {
                 let msg = if pane.filter.is_empty() {
-                    "Folder is empty"
+                    crate::i18n::tr("Folder is empty")
                 } else {
-                    "No items match the filter"
+                    crate::i18n::tr("No items match the filter")
                 };
                 ui.centered_and_justified(|ui| {
                     ui.label(RichText::new(msg).color(pal.dim).size(16.0))
@@ -2282,10 +2279,10 @@ fn details_view(
     let (size_w, date_w, type_w) = (90.0, 140.0, 140.0);
     let name_w = (w - size_w - date_w - type_w).max(160.0);
     let columns = [
-        (SortBy::Name, "Name", name_w),
-        (SortBy::Size, "Size", size_w),
-        (SortBy::Modified, "Modified", date_w),
-        (SortBy::Type, "Type", type_w),
+        (SortBy::Name, crate::i18n::tr("Name"), name_w),
+        (SortBy::Size, crate::i18n::tr("Size"), size_w),
+        (SortBy::Modified, crate::i18n::tr("Modified"), date_w),
+        (SortBy::Type, crate::i18n::tr("Type"), type_w),
     ];
 
     // Header (click to sort, click again to reverse)

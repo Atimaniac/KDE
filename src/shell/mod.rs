@@ -23,23 +23,24 @@ use eframe::egui::{
     ScrollArea, Sense, Shape, Stroke, TextureHandle, Ui, ViewportBuilder, ViewportCommand,
     ViewportId, WindowLevel,
 };
-use startmenu::{AppEntry, Launch};
+use startmenu::{AppEntry, Category, Launch};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
+use chrono::Datelike;
 use std::time::{Duration, Instant};
 use tray::{Click, TrayIcon};
 
 const PANEL_H: f32 = 44.0;
-const LAUNCHER_W: f32 = 480.0;
-const LAUNCHER_H: f32 = 580.0;
+const LAUNCHER_W: f32 = 780.0;
+const LAUNCHER_H: f32 = 540.0;
 const PANEL_TITLE: &str = "Delfin Panel";
 const DESKTOP_TITLE: &str = "Delfin Desktop";
 /// Tray icons shown directly on the panel; the rest go behind the ^ button.
 const TRAY_INLINE: usize = 8;
 const BALLOON_SECS: u64 = 7;
 const QUICK_W: f32 = 380.0;
-const QUICK_H: f32 = 600.0;
+
 
 pub fn run() -> Result<(), eframe::Error> {
     if !win::single_instance("Local\\DelfinShell") {
@@ -87,12 +88,13 @@ enum PanelAction {
     Close(isize),
     FileManager,
     Terminal,
-    ShowDesktop,
+    ToggleCalendar,
     Uri(&'static str),
     Tray(isize, u32, Click, f32),
     Unshelve(isize),
     ToggleOverflow,
-    ToggleQuick,
+    ToggleQuick(quick::Section),
+    Volume(f32),
 }
 
 enum DeskAction {
@@ -109,6 +111,8 @@ struct ShellApp {
     own_pid: u32,
     // panel
     placed: Option<(i32, i32, i32)>,
+    /// Height of Explorer's taskbar in points when it is still running (0 otherwise).
+    lift: f32,
     tasks: Vec<win::TaskWindow>,
     icon_of: HashMap<isize, isize>,
     last_poll: Instant,
@@ -118,6 +122,12 @@ struct ShellApp {
     apps: Vec<AppEntry>,
     launcher_open: bool,
     launcher_query: String,
+    /// Category picked on the left; `None` = empty list until you type.
+    launcher_cat: Option<Category>,
+    launcher_sel: usize,
+    /// Recently launched app names, newest first.
+    recent: Vec<String>,
+    descriptions: Receiver<Vec<(PathBuf, String)>>,
     launcher_focus_pending: bool,
     launcher_seen_focus: bool,
     launcher_closed_at: Instant,
@@ -143,13 +153,25 @@ struct ShellApp {
     shelved: Vec<isize>,
     // quick settings
     qp: quick::QuickPanel,
-    quick_open: bool,
+    quick_open: Option<quick::Section>,
+    quick_last: Option<quick::Section>,
     quick_seen_focus: bool,
     quick_closed_at: Instant,
     vol_state: Option<(f32, bool)>,
     wifi_sig: Option<u32>,
     last_status_poll: Instant,
     store_apps: Receiver<Vec<AppEntry>>,
+    // calendar under the clock
+    calendar_open: bool,
+    calendar_seen_focus: bool,
+    calendar_closed_at: Instant,
+    /// (year, month) shown in the calendar.
+    calendar_month: (i32, u32),
+    /// Last time we looked for a missing tray (Explorer closed after we started).
+    tray_checked: Instant,
+    // Delfin settings window (language, updates, shell options)
+    settings_open: bool,
+    updater: crate::update::Updater,
     // shared
     textures: HashMap<String, Option<TextureHandle>>,
     hotkeys: Receiver<win::Hotkey>,
@@ -205,18 +227,33 @@ impl ShellApp {
         }
 
         let long_ago = Instant::now() - Duration::from_secs(60);
+        let apps = startmenu::scan();
+        let descriptions = startmenu::describe(
+            apps.iter()
+                .filter_map(|a| match &a.target {
+                    Launch::Path(p) => Some(p.clone()),
+                    Launch::Cmd(_) => None,
+                })
+                .collect(),
+            cc.egui_ctx.clone(),
+        );
         let mut app = Self {
             cfg,
             own_pid: std::process::id(),
             placed: None,
+            lift: 0.0,
             tasks: Vec::new(),
             icon_of: HashMap::new(),
             last_poll: long_ago,
             last_fg: 0,
             hidden_for_desktop: Vec::new(),
-            apps: startmenu::scan(),
+            apps,
             launcher_open: false,
             launcher_query: String::new(),
+            launcher_cat: None,
+            launcher_sel: 0,
+            recent: startmenu::load_recent(),
+            descriptions,
             launcher_focus_pending: false,
             launcher_seen_focus: false,
             launcher_closed_at: long_ago,
@@ -238,13 +275,21 @@ impl ShellApp {
             balloon_since: None,
             shelved: Vec::new(),
             qp: quick::QuickPanel::new(&cc.egui_ctx),
-            quick_open: false,
+            quick_open: None,
+            quick_last: None,
             quick_seen_focus: false,
             quick_closed_at: long_ago,
             vol_state: None,
             wifi_sig: None,
             last_status_poll: long_ago,
             store_apps: startmenu::scan_store_apps(cc.egui_ctx.clone()),
+            calendar_open: false,
+            calendar_seen_focus: false,
+            calendar_closed_at: long_ago,
+            calendar_month: (2000, 1),
+            tray_checked: long_ago,
+            settings_open: false,
+            updater: crate::update::Updater::default(),
             textures: HashMap::new(),
             hotkeys: rx,
         };
@@ -389,8 +434,10 @@ impl ShellApp {
             Launch::Cmd(c) => {
                 let _ = win::run_cmdline(c);
             }
+            // Folders open in Delfin, not in Explorer.
+            Launch::Path(p) if p.is_dir() => win::spawn_self(Some(p)),
             Launch::Path(p) => {
-                let _ = open::that(p);
+                win::shell_open(p);
             }
         }
     }
@@ -405,7 +452,9 @@ impl ShellApp {
             if self.launcher_closed_at.elapsed() < Duration::from_millis(300) {
                 return;
             }
-            self.open_quick(false);
+            self.open_quick(None);
+            self.launcher_cat = None;
+            self.launcher_sel = 0;
             self.launcher_query.clear();
             self.launcher_focus_pending = true;
             self.launcher_seen_focus = false;
@@ -416,25 +465,310 @@ impl ShellApp {
         self.launcher_open = open;
     }
 
-    fn open_quick(&mut self, open: bool) {
+    /// Open the volume or network flyout (`None` closes it).
+    fn open_quick(&mut self, open: Option<quick::Section>) {
         if open == self.quick_open {
             return;
         }
-        if open {
-            // Clicking the button while the panel is open first takes its focus
-            // away (which closes it); don't immediately reopen.
-            if self.quick_closed_at.elapsed() < Duration::from_millis(300) {
-                return;
+        if open.is_some() {
+            // Clicking the button while the flyout is open first takes its focus
+            // away (which closes it); don't immediately reopen the same one.
+            if self.quick_open.is_none() && self.quick_closed_at.elapsed() < Duration::from_millis(300) {
+                if self.quick_last == open {
+                    return;
+                }
             }
             self.open_launcher(false);
             self.quick_seen_focus = false;
             self.qp.on_open();
             self.vol_state = self.qp.volume_state();
+            self.quick_last = open;
         } else {
             self.quick_closed_at = Instant::now();
             self.qp.on_close();
         }
         self.quick_open = open;
+    }
+
+    /// Explorer was running when we started (so it owned the tray) and has
+    /// since been closed: take over the notification area now. Programs that
+    /// are already running re-add their icons when they get TaskbarCreated.
+    fn adopt_tray(&mut self, ctx: &egui::Context) {
+        if self.tray.is_some() || self.tray_checked.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.tray_checked = Instant::now();
+        if win::find_class("Shell_TrayWnd").is_none() {
+            self.tray = Some(tray::start(ctx.clone()));
+        }
+    }
+
+    /// Month calendar under the clock, like the Windows one.
+    fn calendar_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        use chrono::NaiveDate;
+        const W: f32 = 320.0;
+        const H: f32 = 330.0;
+        let screen = Self::screen_points(ctx);
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Calendar")
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([W, H])
+            .with_position([screen.x - W - 8.0, screen.y - self.lift - PANEL_H - H - 8.0]);
+
+        let mut close = false;
+        let mut settings = false;
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_calendar"), builder, |ctx, _| {
+                // Created hidden; shown as a tool window so no taskbar button flashes.
+                if !win::reveal_popup("Delfin Calendar", true) {
+                    ctx.request_repaint();
+                }
+            let focused = ctx.input(|i| i.viewport().focused);
+            if focused == Some(true) {
+                self.calendar_seen_focus = true;
+            }
+            if self.calendar_seen_focus && focused == Some(false) {
+                close = true;
+            }
+            if !self.calendar_seen_focus {
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested()) {
+                close = true;
+            }
+            egui::CentralPanel::default()
+                .frame(
+                    Frame::none()
+                        .fill(pal.window)
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .inner_margin(Margin::same(14.0)),
+                )
+                .show(ctx, |ui| {
+                    let now = chrono::Local::now();
+                    let today = now.date_naive();
+                    ui.label(RichText::new(now.format("%H:%M").to_string()).size(28.0));
+                    ui.label(RichText::new(format!("{}, {} {} {}", crate::i18n::weekday_name(today.weekday().num_days_from_monday()), today.day(), crate::i18n::month_in_date(today.month()), today.year())).color(pal.dim));
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    let (y, m) = self.calendar_month;
+                    let first = NaiveDate::from_ymd_opt(y, m, 1).unwrap_or(today);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{} {}", crate::i18n::month_name(first.month()), first.year())).strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("▼").on_hover_text(crate::i18n::tr("Next month")).clicked() {
+                                self.calendar_month = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+                            }
+                            if ui.small_button("▲").on_hover_text(crate::i18n::tr("Previous month")).clicked() {
+                                self.calendar_month = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+                            }
+                            if (y, m) != (today.year(), today.month())
+                                && ui.small_button(crate::i18n::tr("Today")).clicked()
+                            {
+                                self.calendar_month = (today.year(), today.month());
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+
+                    // Monday-first grid, 6 weeks.
+                    let cell = vec2((ui.available_width() / 7.0).floor(), 28.0);
+                    let origin = ui.cursor().min;
+                    for (k, d) in (0..7u32).map(crate::i18n::weekday_short).enumerate() {
+                        ui.painter().text(
+                            origin + vec2(cell.x * (k as f32 + 0.5), cell.y * 0.5),
+                            Align2::CENTER_CENTER,
+                            d,
+                            FontId::proportional(11.5),
+                            pal.dim,
+                        );
+                    }
+                    let lead = first.weekday().num_days_from_monday() as i64;
+                    let start = first - chrono::Duration::days(lead);
+                    for i in 0..42i64 {
+                        let day = start + chrono::Duration::days(i);
+                        let (row, col) = (i / 7, i % 7);
+                        let r = Rect::from_min_size(
+                            origin + vec2(col as f32 * cell.x, (row + 1) as f32 * cell.y),
+                            cell,
+                        );
+                        let in_month = day.month() == m;
+                        if day == today {
+                            ui.painter().circle_filled(r.center(), 12.0, pal.accent);
+                        }
+                        ui.painter().text(
+                            r.center(),
+                            Align2::CENTER_CENTER,
+                            day.day().to_string(),
+                            FontId::proportional(13.0),
+                            if day == today {
+                                Color32::WHITE
+                            } else if in_month {
+                                pal.text
+                            } else {
+                                pal.border
+                            },
+                        );
+                    }
+                    ui.allocate_space(vec2(cell.x * 7.0, cell.y * 7.0));
+                    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                        if ui.small_button(crate::i18n::tr("Date and time settings")).clicked() {
+                            settings = true;
+                        }
+                    });
+                });
+        });
+        if settings {
+            win::shell_open("ms-settings:dateandtime");
+            close = true;
+        }
+        if close {
+            self.calendar_open = false;
+            self.calendar_closed_at = Instant::now();
+        }
+    }
+
+    /// Delfin's own settings: language, updates from GitHub, shell options.
+    fn settings_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        use crate::i18n::{tr, trf, Lang};
+        use crate::update::State;
+        const W: f32 = 480.0;
+        const H: f32 = 460.0;
+        let screen = Self::screen_points(ctx);
+        let builder = ViewportBuilder::default()
+            .with_title(tr("Delfin Settings"))
+            .with_resizable(false)
+            .with_inner_size([W, H])
+            .with_position([(screen.x - W) / 2.0, (screen.y - H) / 2.0]);
+
+        let mut close = false;
+        let mut restart = false;
+        let mut back_to_explorer = false;
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_settings"), builder, |ctx, _| {
+            if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape)) {
+                close = true;
+            }
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window).inner_margin(Margin::same(18.0)))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
+                        paint_logo(ui.painter(), r.center(), 18.0, pal);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Delfin").size(18.0).strong());
+                            ui.label(RichText::new(trf("Version {}", &[&crate::update::CURRENT])).color(pal.dim));
+                        });
+                    });
+                    ui.add_space(10.0);
+
+                    // ---- language
+                    ui.label(RichText::new(tr("Language")).strong());
+                    let mut lang = crate::i18n::lang();
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut lang, Lang::En, "English");
+                        ui.radio_value(&mut lang, Lang::Pl, "Polski");
+                    });
+                    if lang != crate::i18n::lang() {
+                        crate::i18n::set_lang(lang);
+                    }
+                    ui.label(
+                        RichText::new(tr("Some open Delfin windows switch language after they are reopened."))
+                            .size(11.5)
+                            .color(pal.dim),
+                    );
+                    ui.add_space(10.0);
+                    ui.separator();
+
+                    // ---- updates
+                    ui.label(RichText::new(tr("Updates")).strong());
+                    let state = self.updater.get();
+                    ui.horizontal(|ui| {
+                        let busy = matches!(state, State::Checking | State::Downloading);
+                        if ui.add_enabled(!busy, egui::Button::new(tr("Check for updates"))).clicked() {
+                            self.updater.check(ctx);
+                        }
+                        if let State::Available(r) = &state {
+                            if ui.button(tr("Download and install")).clicked() {
+                                self.updater.install(r.clone(), ctx);
+                            }
+                        }
+                        if matches!(state, State::Installed) && ui.button(tr("Restart")).clicked() {
+                            restart = true;
+                        }
+                    });
+                    let (msg, col) = match &state {
+                        State::Idle => (String::new(), pal.dim),
+                        State::Checking => (tr("Checking for updates…").to_string(), pal.dim),
+                        State::UpToDate => (tr("You have the latest version.").to_string(), pal.dim),
+                        State::Available(r) => (trf("Version {} is available.", &[&r.version]), pal.accent),
+                        State::Downloading => (tr("Downloading…").to_string(), pal.dim),
+                        State::Installed => (tr("Update installed. Delfin will restart.").to_string(), pal.accent),
+                        State::Error(e) => (e.clone(), pal.danger),
+                    };
+                    if !msg.is_empty() {
+                        ui.label(RichText::new(msg).color(col));
+                    }
+                    if let State::Available(r) = &state {
+                        if !r.notes.trim().is_empty() {
+                            egui::CollapsingHeader::new(tr("Release notes")).show(ui, |ui| {
+                                ScrollArea::vertical().max_height(90.0).show(ui, |ui| {
+                                    ui.label(RichText::new(r.notes.trim()).size(12.0));
+                                });
+                            });
+                        }
+                    }
+                    if let Some(p) = crate::update::target_path() {
+                        ui.label(
+                            RichText::new(trf("Updates replace: {}", &[&p.display()]))
+                                .size(11.5)
+                                .color(pal.dim),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.separator();
+
+                    // ---- shell options
+                    ui.label(RichText::new(tr("Shell")).strong());
+                    if ui.checkbox(&mut self.cfg.minimize_to_tray, tr("Minimize to tray")).changed() {
+                        self.cfg.save();
+                        if !self.cfg.minimize_to_tray {
+                            self.unshelve_all();
+                        }
+                    }
+                    let armed = self
+                        .power_armed
+                        .is_some_and(|(p, t)| p == Power::BackToExplorer && t.elapsed() < Duration::from_secs(5));
+                    let label = if armed { tr("Click again to switch") } else { tr("Back to Explorer") };
+                    if ui.button(label).clicked() {
+                        back_to_explorer = true;
+                    }
+                });
+        });
+
+        if back_to_explorer {
+            let confirmed = self
+                .power_armed
+                .is_some_and(|(q, t)| q == Power::BackToExplorer && t.elapsed() < Duration::from_secs(5));
+            if confirmed {
+                self.power(Power::BackToExplorer);
+            } else {
+                self.power_armed = Some((Power::BackToExplorer, Instant::now()));
+            }
+        }
+        if restart {
+            // Start the new exe once this one has exited (only one shell may run).
+            if let Some(exe) = crate::update::target_path() {
+                win::run_hidden(&format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\" --shell", exe.display()));
+            }
+            self.unshelve_all();
+            ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
+        }
+        if close {
+            self.settings_open = false;
+        }
     }
 
     /// Volume and Wi-Fi signal for the panel icon (every 2 s).
@@ -443,23 +777,24 @@ impl ShellApp {
             return;
         }
         self.last_status_poll = Instant::now();
-        if !self.quick_open {
+        if self.quick_open.is_none() {
             self.qp.refresh_volume(); // the default device may have changed
         }
         self.vol_state = self.qp.volume_state();
         self.wifi_sig = self.qp.wifi_signal();
     }
 
-    fn quick_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+    fn quick_viewport(&mut self, ctx: &egui::Context, pal: &Palette, section: quick::Section) {
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Quick Settings")
+            .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_inner_size([QUICK_W, QUICK_H])
-            .with_position([screen.x - QUICK_W - 8.0, screen.y - PANEL_H - QUICK_H - 8.0]);
+            .with_inner_size([QUICK_W, section.height()])
+            .with_position([screen.x - QUICK_W - 8.0, screen.y - self.lift - PANEL_H - section.height() - 8.0]);
 
         let mut close = false;
         let mut action = None;
@@ -467,6 +802,10 @@ impl ShellApp {
             ViewportId::from_hash_of("delfin_quick_settings"),
             builder,
             |ctx, _| {
+                // Created hidden; shown as a tool window so no taskbar button flashes.
+                if !win::reveal_popup("Delfin Quick Settings", true) {
+                    ctx.request_repaint();
+                }
                 let focused = ctx.input(|i| i.viewport().focused);
                 if focused == Some(true) {
                     self.quick_seen_focus = true;
@@ -488,20 +827,20 @@ impl ShellApp {
                             .inner_margin(Margin::same(14.0)),
                     )
                     .show(ctx, |ui| {
-                        action = self.qp.ui(ui, pal);
+                        action = self.qp.ui(ui, pal, section);
                     });
             },
         );
         match action {
             Some(quick::QuickAction::Open(uri)) => {
-                let _ = open::that(uri);
+                win::shell_open(uri);
                 close = true;
             }
             Some(quick::QuickAction::Close) => close = true,
             None => {}
         }
         if close {
-            self.open_quick(false);
+            self.open_quick(None);
         } else {
             self.vol_state = self.qp.volume_state();
         }
@@ -599,16 +938,19 @@ impl ShellApp {
         let ppp = ctx.pixels_per_point();
         let (w_px, h_px) = win::screen_px();
         let panel_px = (PANEL_H * ppp).round() as i32;
-        let key = (w_px, h_px, panel_px);
+        // Explorer still running (trying the shell out): sit just above its taskbar.
+        let explorer_px = win::explorer_taskbar_px(self.own_pid);
+        let key = (w_px, h_px, panel_px + explorer_px * 10_000);
         if self.placed == Some(key) {
             return;
         }
         self.placed = Some(key);
+        self.lift = explorer_px as f32 / ppp;
         let w = w_px as f32 / ppp;
         let h = h_px as f32 / ppp;
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(0.0, h - PANEL_H)));
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(0.0, h - self.lift - PANEL_H)));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(w, PANEL_H)));
-        win::set_work_area(panel_px);
+        win::set_work_area(panel_px + explorer_px);
     }
 
     fn screen_points(ctx: &egui::Context) -> egui::Vec2 {
@@ -684,51 +1026,62 @@ impl ShellApp {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Show desktop: thin strip at the very right (like Windows/Plasma).
-                        let (r, resp) = ui.allocate_exact_size(vec2(10.0, 36.0), Sense::click());
-                        if resp.hovered() {
-                            ui.painter().rect_filled(r, 2.0, pal.hover);
+                        let c = clock(ui, self.calendar_open, pal);
+                        if c.clicked() {
+                            actions.push(PanelAction::ToggleCalendar);
                         }
-                        ui.painter().line_segment(
-                            [r.left_top(), r.left_bottom()],
-                            Stroke::new(1.0_f32, pal.border),
-                        );
-                        if resp.clicked() {
-                            actions.push(PanelAction::ShowDesktop);
-                        }
-
-                        if clock(ui, pal).clicked() {
+                        if c.secondary_clicked() {
                             actions.push(PanelAction::Uri("ms-settings:dateandtime"));
                         }
-                        // Wi-Fi + volume in one button, like Windows 11: opens Quick Settings.
-                        {
-                            let (r, resp) = ui.allocate_exact_size(vec2(56.0, 36.0), Sense::click());
+                        // Volume and network: two separate buttons, each with its own
+                        // flyout (layout is right-to-left, so volume is drawn first).
+                        for section in [quick::Section::Sound, quick::Section::Network] {
+                            let (r, resp) = ui.allocate_exact_size(vec2(30.0, 36.0), Sense::click());
                             let p = ui.painter();
-                            if self.quick_open {
+                            if self.quick_open == Some(section) {
                                 p.rect_filled(r, 4.0, pal.select);
                             } else if resp.hovered() {
                                 p.rect_filled(r, 4.0, pal.hover);
                             }
-                            let (left, right) = r.split_left_right_at_fraction(0.5);
-                            quick::paint_wifi(p, left, pal.text, pal.dim.gamma_multiply(0.5), self.wifi_sig);
-                            let level = self
-                                .vol_state
-                                .map(|(l, m)| if m { None } else { Some(l) })
-                                .unwrap_or(Some(1.0));
-                            quick::paint_speaker(p, right, pal.text, level);
+                            let tip = match section {
+                                quick::Section::Sound => {
+                                    let level = self
+                                        .vol_state
+                                        .map(|(l, m)| if m { None } else { Some(l) })
+                                        .unwrap_or(Some(1.0));
+                                    quick::paint_speaker(p, r, pal.text, level);
+                                    // Mouse wheel over the speaker changes the volume.
+                                    if resp.hovered() {
+                                        let wheel = ui.input(|i| i.raw_scroll_delta.y);
+                                        if wheel != 0.0 {
+                                            actions.push(PanelAction::Volume(wheel.signum() * 0.02));
+                                        }
+                                    }
+                                    match self.vol_state {
+                                        Some((_, true)) => crate::i18n::tr("Volume: muted").to_string(),
+                                        Some((l, false)) => crate::i18n::trf("Volume: {}%", &[&(l * 100.0).round()]),
+                                        None => crate::i18n::tr("Volume").to_string(),
+                                    }
+                                }
+                                quick::Section::Network => {
+                                    quick::paint_wifi(p, r, pal.text, pal.dim.gamma_multiply(0.5), self.wifi_sig);
+                                    match self.qp.connected_ssid() {
+                                        Some(ssid) => crate::i18n::trf("Wi-Fi: {}", &[&ssid]),
+                                        None => crate::i18n::tr("Network").to_string(),
+                                    }
+                                }
+                            };
                             if resp.hovered() {
-                                let tip = match self.vol_state {
-                                    Some((_, true)) => "Quick Settings – muted".to_string(),
-                                    Some((l, false)) => format!("Quick Settings – volume {:.0}%", l * 100.0),
-                                    None => "Quick Settings".to_string(),
-                                };
                                 hovered = Some((tip, r.center().x));
                             }
                             if resp.clicked() {
-                                actions.push(PanelAction::ToggleQuick);
+                                actions.push(PanelAction::ToggleQuick(section));
                             }
                             if resp.secondary_clicked() {
-                                actions.push(PanelAction::Uri("ms-settings:sound"));
+                                actions.push(PanelAction::Uri(match section {
+                                    quick::Section::Sound => "ms-settings:sound",
+                                    quick::Section::Network => "ms-settings:network",
+                                }));
                             }
                         }
                         // ---- notification area (layout is right-to-left, so iterate reversed)
@@ -787,7 +1140,7 @@ impl ShellApp {
                                 vec2(24.0, 36.0),
                             );
                             if r.hovered() {
-                                hovered = Some(("Show hidden icons".into(), r.rect.center().x));
+                                hovered = Some((crate::i18n::tr("Show hidden icons").into(), r.rect.center().x));
                             }
                             if r.clicked() {
                                 actions.push(PanelAction::ToggleOverflow);
@@ -818,9 +1171,13 @@ impl ShellApp {
                         self.overflow_seen_focus = false;
                     }
                 }
-                PanelAction::ToggleQuick => {
-                    let open = !self.quick_open;
+                PanelAction::ToggleQuick(section) => {
+                    let open = (self.quick_open != Some(section)).then_some(section);
                     self.open_quick(open);
+                }
+                PanelAction::Volume(delta) => {
+                    self.qp.nudge_volume(delta);
+                    self.vol_state = self.qp.volume_state();
                 }
                 PanelAction::ToggleLauncher => {
                     let open = !self.launcher_open;
@@ -841,9 +1198,21 @@ impl ShellApp {
                     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"));
                     let _ = crate::platform::open_terminal(&home);
                 }
-                PanelAction::ShowDesktop => self.show_desktop(),
+                PanelAction::ToggleCalendar => {
+                    if self.calendar_open {
+                        self.calendar_open = false;
+                        self.calendar_closed_at = Instant::now();
+                    } else if self.calendar_closed_at.elapsed() > Duration::from_millis(300) {
+                        self.open_quick(None);
+                        self.open_launcher(false);
+                        self.calendar_open = true;
+                        self.calendar_seen_focus = false;
+                        let today = chrono::Local::now().date_naive();
+                        self.calendar_month = (today.year(), today.month());
+                    }
+                }
                 PanelAction::Uri(u) => {
-                    let _ = open::that(u);
+                    win::shell_open(u);
                 }
             }
         }
@@ -855,21 +1224,51 @@ impl ShellApp {
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Launcher")
+            .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size([LAUNCHER_W, LAUNCHER_H])
-            .with_position([4.0, screen.y - PANEL_H - LAUNCHER_H - 4.0]);
+            .with_position([4.0, screen.y - self.lift - PANEL_H - LAUNCHER_H - 4.0]);
 
         let mut close = false;
-        let mut launch: Option<Launch> = None;
+        let mut launch: Option<(Launch, Option<String>)> = None;
         let mut power: Option<Power> = None;
+
+        // What the middle column shows: nothing until you type or pick a category.
+        let query = self.launcher_query.trim().to_string();
+        let rows: Vec<usize> = if !query.is_empty() {
+            startmenu::search(&self.apps, &query)
+        } else {
+            match self.launcher_cat {
+                None => Vec::new(),
+                Some(Category::All) => (0..self.apps.len()).collect(),
+                Some(Category::Recent) => self
+                    .recent
+                    .iter()
+                    .filter_map(|n| self.apps.iter().position(|a| &a.name == n))
+                    .collect(),
+                Some(c) => (0..self.apps.len())
+                    .filter(|&i| startmenu::category_of(&self.apps[i]) == Some(c))
+                    .collect(),
+            }
+        };
+        // With a search, the last row runs the typed text as a command.
+        let run_row = !query.is_empty();
+        let n_rows = rows.len() + run_row as usize;
+        if self.launcher_sel >= n_rows {
+            self.launcher_sel = n_rows.saturating_sub(1);
+        }
 
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("delfin_launcher"),
             builder,
             |ctx, _| {
+                // Created hidden; shown as a tool window so no taskbar button flashes.
+                if !win::reveal_popup("Delfin Launcher", true) {
+                    ctx.request_repaint();
+                }
                 if self.launcher_focus_pending {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
@@ -883,218 +1282,302 @@ impl ShellApp {
                 if ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested()) {
                     close = true;
                 }
+                let (down, up, enter) = ctx.input(|i| {
+                    (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp), i.key_pressed(Key::Enter))
+                });
+                let mut scroll_to_sel = false;
+                if down && self.launcher_sel + 1 < n_rows {
+                    self.launcher_sel += 1;
+                    scroll_to_sel = true;
+                }
+                if up && self.launcher_sel > 0 {
+                    self.launcher_sel -= 1;
+                    scroll_to_sel = true;
+                }
+                if enter && n_rows > 0 {
+                    launch = Some(match rows.get(self.launcher_sel) {
+                        Some(&i) => (self.apps[i].target.clone(), Some(self.apps[i].name.clone())),
+                        None => (Launch::Cmd(query.clone()), None),
+                    });
+                }
 
                 egui::CentralPanel::default()
                     .frame(
                         Frame::none()
                             .fill(pal.window)
                             .stroke(Stroke::new(1.0_f32, pal.border))
-                            .inner_margin(Margin::same(12.0)),
+                            .inner_margin(Margin::same(14.0)),
                     )
                     .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
-                            ui.painter().circle_filled(r.center(), 16.0, pal.accent);
-                            let user = std::env::var("USERNAME").unwrap_or_else(|_| "User".into());
-                            let initial: String =
-                                user.chars().take(1).collect::<String>().to_uppercase();
-                            ui.painter().text(
-                                r.center(),
-                                Align2::CENTER_CENTER,
-                                initial,
-                                FontId::proportional(16.0),
-                                Color32::WHITE,
-                            );
-                            ui.label(RichText::new(user).strong().size(15.0));
-                        });
-                        ui.add_space(8.0);
+                        let full = ui.max_rect();
+                        let left_w = 176.0;
+                        let right_w = 176.0;
 
-                        let r = ui.add(
+                        // ---- header: logo + search
+                        let logo = Rect::from_min_size(full.min, vec2(left_w, 44.0));
+                        paint_logo(ui.painter(), logo.center(), 20.0, pal);
+                        let search = Rect::from_min_max(
+                            pos2(full.left() + left_w + 8.0, full.top() + 4.0),
+                            pos2(full.right(), full.top() + 40.0),
+                        );
+                        ui.painter().rect(search, 18.0, pal.view, Stroke::new(1.0_f32, pal.border));
+                        icons::paint_tool(
+                            ui.painter(),
+                            Rect::from_center_size(pos2(search.left() + 20.0, search.center().y), vec2(18.0, 18.0)),
+                            Tool::Search,
+                            pal.dim,
+                        );
+                        let before = self.launcher_query.clone();
+                        let te = ui.put(
+                            Rect::from_min_max(pos2(search.left() + 36.0, search.top() + 4.0), search.max - vec2(14.0, 4.0)),
                             egui::TextEdit::singleline(&mut self.launcher_query)
-                                .hint_text("Search apps, or type a command…")
-                                .desired_width(f32::INFINITY),
+                                .hint_text(crate::i18n::tr("Search applications…"))
+                                .frame(false)
+                                .font(FontId::proportional(15.0))
+                                .vertical_align(Align::Center),
                         );
                         if self.launcher_focus_pending {
-                            r.request_focus();
+                            te.request_focus();
                             self.launcher_focus_pending = false;
                         }
-                        let q = self.launcher_query.trim().to_lowercase();
-                        let matches: Vec<usize> = (0..self.apps.len())
-                            .filter(|&i| {
-                                q.is_empty()
-                                    || self.apps[i].name.to_lowercase().contains(&q)
-                                    || self.apps[i].folder.to_lowercase().contains(&q)
-                            })
-                            .collect();
-                        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            if let Some(&i) = matches.first() {
-                                launch = Some(self.apps[i].target.clone());
-                            } else if !q.is_empty() {
-                                launch = Some(Launch::Cmd(self.launcher_query.trim().to_string()));
-                            }
+                        if self.launcher_query != before {
+                            self.launcher_sel = 0;
                         }
-                        ui.add_space(6.0);
 
-                        let list_h = ui.available_height() - 52.0;
-                        let row_h = 34.0;
-                        ScrollArea::vertical()
-                            .max_height(list_h)
-                            .auto_shrink([false, false])
-                            .show_rows(ui, row_h, matches.len(), |ui, range| {
-                                for &i in &matches[range] {
-                                    let app = self.apps[i].clone();
-                                    let w = ui.available_width();
-                                    let (rect, resp) =
-                                        ui.allocate_exact_size(vec2(w, row_h), Sense::click());
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(rect, 4.0, pal.hover);
-                                    }
-                                    let ir = Rect::from_center_size(
-                                        pos2(rect.left() + 18.0, rect.center().y),
-                                        vec2(24.0, 24.0),
-                                    );
-                                    match (&app.icon, &app.target) {
-                                        (Some(t), _) => {
-                                            icons::paint_tool(ui.painter(), ir, *t, pal.text)
-                                        }
-                                        (None, Launch::Path(p)) => {
-                                            match self.tex_file(ctx, p, false) {
-                                                Some(tex) => {
-                                                    ui.painter().image(
-                                                        tex.id(),
-                                                        ir,
-                                                        uv_full(),
-                                                        Color32::WHITE,
-                                                    );
+                        let body_top = full.top() + 56.0;
+                        let left = Rect::from_min_max(pos2(full.left(), body_top), pos2(full.left() + left_w, full.bottom()));
+                        let right = Rect::from_min_max(pos2(full.right() - right_w, body_top), full.max);
+                        let mid = Rect::from_min_max(pos2(left.right() + 10.0, body_top), pos2(right.left() - 10.0, full.bottom()));
+                        let line = Stroke::new(1.0_f32, pal.border);
+                        ui.painter().line_segment([pos2(mid.left() - 5.0, body_top), pos2(mid.left() - 5.0, full.bottom())], line);
+                        ui.painter().line_segment([pos2(mid.right() + 5.0, body_top), pos2(mid.right() + 5.0, full.bottom())], line);
+
+                        // ---- left: categories
+                        let mut y = left.top();
+                        for cat in Category::LIST {
+                            let r = Rect::from_min_size(pos2(left.left(), y), vec2(left.width() - 8.0, 36.0));
+                            let resp = ui.interact(r, ui.id().with(("cat", cat.label())), Sense::click());
+                            let on = query.is_empty() && self.launcher_cat == Some(cat);
+                            if on {
+                                ui.painter().rect_filled(r, 6.0, pal.select);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(r, 6.0, pal.hover);
+                            }
+                            paint_category(
+                                ui.painter(),
+                                Rect::from_center_size(pos2(r.left() + 20.0, r.center().y), vec2(20.0, 20.0)),
+                                cat,
+                                pal,
+                            );
+                            ui.painter().text(
+                                pos2(r.left() + 40.0, r.center().y),
+                                Align2::LEFT_CENTER,
+                                cat.label(),
+                                FontId::proportional(14.0),
+                                pal.text,
+                            );
+                            if resp.clicked() {
+                                self.launcher_cat = if self.launcher_cat == Some(cat) { None } else { Some(cat) };
+                                self.launcher_query.clear();
+                                self.launcher_sel = 0;
+                                self.launcher_focus_pending = true;
+                            }
+                            y += 40.0;
+                        }
+
+                        // ---- middle: empty state, a category, or search results
+                        if n_rows == 0 {
+                            let c = mid.center() - vec2(0.0, 20.0);
+                            icons::paint_tool(ui.painter(), Rect::from_center_size(c - vec2(0.0, 28.0), vec2(26.0, 26.0)), Tool::Search, pal.dim);
+                            let (title, sub) = if !query.is_empty() {
+                                (crate::i18n::tr("No matching applications"), crate::i18n::tr("Press Enter to run it as a command"))
+                            } else if self.launcher_cat == Some(Category::Recent) {
+                                (crate::i18n::tr("Nothing launched yet"), crate::i18n::tr("Apps you start from here show up in this list"))
+                            } else if self.launcher_cat.is_some() {
+                                (crate::i18n::tr("No applications in this category"), crate::i18n::tr("Search finds every installed app"))
+                            } else {
+                                (crate::i18n::tr("Start typing to find an app"), crate::i18n::tr("or pick a category on the left"))
+                            };
+                            ui.painter().text(c + vec2(0.0, 6.0), Align2::CENTER_CENTER, title, FontId::proportional(15.0), pal.text);
+                            ui.painter().text(c + vec2(0.0, 28.0), Align2::CENTER_CENTER, sub, FontId::proportional(12.5), pal.dim);
+                        } else {
+                            let heading = if !query.is_empty() {
+                                crate::i18n::tr("Results").to_string()
+                            } else {
+                                self.launcher_cat.map(|c| c.label().to_string()).unwrap_or_default()
+                            };
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(mid), |ui| {
+                                ui.label(RichText::new(heading).size(12.0).color(pal.dim));
+                                ui.add_space(2.0);
+                                ScrollArea::vertical()
+                                    .id_salt("launcher-list")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        for k in 0..n_rows {
+                                            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+                                            if resp.hovered() && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                                                self.launcher_sel = k;
+                                            }
+                                            if k == self.launcher_sel {
+                                                ui.painter().rect_filled(r, 6.0, pal.hover);
+                                                if scroll_to_sel {
+                                                    ui.scroll_to_rect(r, None);
                                                 }
-                                                None => icons::paint_file(
-                                                    ui.painter(),
-                                                    ir,
-                                                    icons::kind_color(icons::Kind::Exe),
-                                                    "",
-                                                    pal,
-                                                ),
+                                            }
+                                            if !ui.is_rect_visible(r) {
+                                                continue;
+                                            }
+                                            let ir = Rect::from_center_size(pos2(r.left() + 22.0, r.center().y), vec2(30.0, 30.0));
+                                            let tx = r.left() + 46.0;
+                                            let (name, desc) = match rows.get(k) {
+                                                Some(&i) => {
+                                                    let app = self.apps[i].clone();
+                                                    match (&app.icon, &app.target) {
+                                                        (Some(t), _) => icons::paint_tool(ui.painter(), ir.shrink(3.0), *t, pal.text),
+                                                        (None, Launch::Path(p)) => match self.tex_file(ctx, p, true) {
+                                                            Some(tex) => {
+                                                                ui.painter().image(tex.id(), ir, uv_full(), Color32::WHITE);
+                                                            }
+                                                            None => icons::paint_file(ui.painter(), ir, icons::kind_color(icons::Kind::Exe), "", pal),
+                                                        },
+                                                        _ => {}
+                                                    }
+                                                    if resp.clicked() {
+                                                        launch = Some((app.target.clone(), Some(app.name.clone())));
+                                                    }
+                                                    let desc = if app.desc.is_empty() { app.folder.clone() } else { app.desc.clone() };
+                                                    (app.name, desc)
+                                                }
+                                                None => {
+                                                    icons::paint_tool(ui.painter(), ir.shrink(4.0), Tool::Terminal, pal.dim);
+                                                    if resp.clicked() {
+                                                        launch = Some((Launch::Cmd(query.clone()), None));
+                                                    }
+                                                    (crate::i18n::trf("Run \u{201c}{}\u{201d}", &[&query]), crate::i18n::tr("Command").to_string())
+                                                }
+                                            };
+                                            let p = ui.painter().with_clip_rect(r.shrink(2.0));
+                                            if desc.is_empty() {
+                                                p.text(pos2(tx, r.center().y), Align2::LEFT_CENTER, &name, FontId::proportional(14.0), pal.text);
+                                            } else {
+                                                p.text(pos2(tx, r.center().y - 8.0), Align2::LEFT_CENTER, &name, FontId::proportional(14.0), pal.text);
+                                                p.text(pos2(tx, r.center().y + 10.0), Align2::LEFT_CENTER, &desc, FontId::proportional(12.0), pal.dim);
                                             }
                                         }
-                                        _ => {}
-                                    }
-                                    let tx = rect.left() + 40.0;
-                                    let p = ui.painter().with_clip_rect(rect);
-                                    if app.folder.is_empty() {
-                                        p.text(
-                                            pos2(tx, rect.center().y),
-                                            Align2::LEFT_CENTER,
-                                            &app.name,
-                                            FontId::proportional(13.5),
-                                            pal.text,
-                                        );
-                                    } else {
-                                        p.text(
-                                            pos2(tx, rect.center().y - 7.0),
-                                            Align2::LEFT_CENTER,
-                                            &app.name,
-                                            FontId::proportional(13.5),
-                                            pal.text,
-                                        );
-                                        p.text(
-                                            pos2(tx, rect.center().y + 8.0),
-                                            Align2::LEFT_CENTER,
-                                            &app.folder,
-                                            FontId::proportional(11.0),
-                                            pal.dim,
-                                        );
-                                    }
-                                    if resp.clicked() {
-                                        launch = Some(app.target.clone());
-                                    }
-                                }
-                                if matches.is_empty() && !q.is_empty() {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "Press Enter to run \u{201c}{}\u{201d}",
-                                            self.launcher_query.trim()
-                                        ))
-                                        .color(pal.dim),
-                                    );
-                                }
+                                    });
                             });
+                        }
 
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            let armed = self
-                                .power_armed
-                                .filter(|(_, t)| t.elapsed() < Duration::from_secs(5))
-                                .map(|(p, _)| p);
-                            let btn = |ui: &mut Ui, tool: Tool, label: &str, p: Option<Power>| {
-                                let text = if p.is_some() && armed == p {
-                                    "Click again"
-                                } else {
-                                    label
-                                };
-                                let r = ui.add(egui::Button::new(text).min_size(vec2(0.0, 30.0)));
-                                let icon_r = Rect::from_center_size(
-                                    pos2(r.rect.left() - 12.0, r.rect.center().y),
-                                    vec2(18.0, 18.0),
-                                );
-                                icons::paint_tool(ui.painter(), icon_r, tool, pal.dim);
-                                r.clicked()
-                            };
-                            ui.add_space(20.0);
-                            if btn(ui, Tool::Lock, "Lock", None) {
-                                win::run_hidden("rundll32.exe user32.dll,LockWorkStation");
-                                close = true;
+                        // ---- right: places and system shortcuts
+                        let links: [(Option<Tool>, &str); 7] = [
+                            (Some(Tool::Desktop), crate::i18n::tr("This PC")),
+                            (None, crate::i18n::tr("Documents")),
+                            (None, crate::i18n::tr("Downloads")),
+                            (Some(Tool::Gear), crate::i18n::tr("Settings")),
+                            (Some(Tool::Details), crate::i18n::tr("Task Manager")),
+                            (Some(Tool::Terminal), crate::i18n::tr("Run…")),
+                            (None, "Delfin"),
+                        ];
+                        let mut y = right.top();
+                        for (k, (tool, label)) in links.iter().enumerate() {
+                            let r = Rect::from_min_size(pos2(right.left(), y), vec2(right.width(), 38.0));
+                            let resp = ui.interact(r, ui.id().with(("link", k)), Sense::click());
+                            ui.painter().rect(
+                                r,
+                                6.0,
+                                if resp.hovered() { pal.hover } else { pal.view },
+                                Stroke::new(1.0_f32, pal.border),
+                            );
+                            let ir = Rect::from_center_size(pos2(r.left() + 20.0, r.center().y), vec2(18.0, 18.0));
+                            match tool {
+                                Some(t) => icons::paint_tool(ui.painter(), ir, *t, pal.text),
+                                None if k == 6 => paint_logo(ui.painter(), ir.center(), 9.0, pal),
+                                None => icons::paint_folder(ui.painter(), ir, icons::FOLDER),
                             }
-                            ui.add_space(22.0);
-                            for (tool, label, p) in [
-                                (Tool::Logout, "Log Out", Power::Logout),
-                                (Tool::Refresh, "Restart", Power::Restart),
-                                (Tool::Power, "Shut Down", Power::Shutdown),
-                            ] {
-                                if btn(ui, tool, label, Some(p)) {
-                                    power = Some(p);
+                            ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, *label, FontId::proportional(13.5), pal.text);
+                            if resp.clicked() {
+                                match k {
+                                    0 => launch = Some((Launch::Cmd("delfin".into()), None)),
+                                    1 => {
+                                        if let Some(d) = dirs::document_dir() {
+                                            launch = Some((Launch::Path(d), None));
+                                        }
+                                    }
+                                    2 => {
+                                        if let Some(d) = dirs::download_dir() {
+                                            launch = Some((Launch::Path(d), None));
+                                        }
+                                    }
+                                    3 => launch = Some((Launch::Cmd("ms-settings:".into()), None)),
+                                    4 => launch = Some((Launch::Cmd("taskmgr.exe".into()), None)),
+                                    5 => {
+                                        // Run: the search box doubles as the Run box.
+                                        self.launcher_cat = None;
+                                        self.launcher_focus_pending = true;
+                                    }
+                                    _ => {
+                                        self.settings_open = true;
+                                        close = true;
+                                    }
                                 }
-                                ui.add_space(22.0);
                             }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.small_button("Settings").clicked() {
-                                launch = Some(Launch::Cmd("ms-settings:".into()));
+                            y += 44.0;
+                        }
+
+                        let power_top = right.bottom() - 54.0;
+
+                        // ---- power row
+                        ui.painter().line_segment([pos2(right.left(), power_top), pos2(right.right(), power_top)], line);
+                        let armed = self
+                            .power_armed
+                            .filter(|(_, t)| t.elapsed() < Duration::from_secs(5))
+                            .map(|(p, _)| p);
+                        let buttons: [(Tool, &str, Option<Power>, Color32); 4] = [
+                            (Tool::Lock, crate::i18n::tr("Lock"), None, pal.text),
+                            (Tool::Power, crate::i18n::tr("Shut Down"), Some(Power::Shutdown), pal.danger),
+                            (Tool::Refresh, crate::i18n::tr("Restart"), Some(Power::Restart), pal.accent),
+                            (Tool::Logout, crate::i18n::tr("Log Out"), Some(Power::Logout), Color32::from_rgb(0x27, 0xae, 0x60)),
+                        ];
+                        let bw = right.width() / 4.0;
+                        for (k, (tool, label, p, col)) in buttons.iter().enumerate() {
+                            let r = Rect::from_min_size(pos2(right.left() + k as f32 * bw, power_top + 4.0), vec2(bw, 50.0));
+                            let resp = ui.interact(r, ui.id().with(("power", k)), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, 6.0, pal.hover);
                             }
-                            if ui.small_button("Task Manager").clicked() {
-                                launch = Some(Launch::Cmd("taskmgr.exe".into()));
-                            }
-                            if ui
-                                .checkbox(&mut self.cfg.minimize_to_tray, "Minimize to tray")
-                                .changed()
-                            {
-                                self.cfg.save();
-                                if !self.cfg.minimize_to_tray {
-                                    self.unshelve_all();
+                            let is_armed = p.is_some() && armed == *p;
+                            icons::paint_tool(
+                                ui.painter(),
+                                Rect::from_center_size(pos2(r.center().x, r.top() + 16.0), vec2(20.0, 20.0)),
+                                *tool,
+                                *col,
+                            );
+                            ui.painter().text(
+                                pos2(r.center().x, r.top() + 38.0),
+                                Align2::CENTER_CENTER,
+                                if is_armed { crate::i18n::tr("Sure?") } else { *label },
+                                FontId::proportional(10.5),
+                                if is_armed { pal.danger } else { pal.text },
+                            );
+                            let resp = resp.on_hover_text(if p.is_some() { crate::i18n::trf("{} (click twice)", &[label]) } else { label.to_string() });
+                            if resp.clicked() {
+                                match p {
+                                    Some(p) => power = Some(*p),
+                                    None => {
+                                        win::run_hidden("rundll32.exe user32.dll,LockWorkStation");
+                                        close = true;
+                                    }
                                 }
                             }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let armed = self.power_armed.is_some_and(|(p, t)| {
-                                    p == Power::BackToExplorer
-                                        && t.elapsed() < Duration::from_secs(5)
-                                });
-                                let label = if armed {
-                                    "Click again to switch"
-                                } else {
-                                    "Back to Explorer"
-                                };
-                                if ui
-                                    .small_button(RichText::new(label).color(pal.dim))
-                                    .clicked()
-                                {
-                                    power = Some(Power::BackToExplorer);
-                                }
-                            });
-                        });
+                        }
                     });
             },
         );
 
-        if let Some(l) = launch {
+        if let Some((l, name)) = launch {
+            if let Some(n) = name {
+                startmenu::push_recent(&mut self.recent, &n);
+            }
             self.launch(&l);
             close = true;
         }
@@ -1130,12 +1613,13 @@ impl ShellApp {
         let x = (screen.x - size.x - 260.0).max(0.0);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Tray")
+            .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size(size)
-            .with_position([x, screen.y - PANEL_H - size.y - 4.0]);
+            .with_position([x, screen.y - self.lift - PANEL_H - size.y - 4.0]);
 
         let mut close = false;
         let mut clicks: Vec<(isize, u32, Click, f32)> = Vec::new();
@@ -1143,6 +1627,10 @@ impl ShellApp {
             ViewportId::from_hash_of("delfin_tray_overflow"),
             builder,
             |ctx, _| {
+                // Created hidden; shown as a tool window so no taskbar button flashes.
+                if !win::reveal_popup("Delfin Tray", true) {
+                    ctx.request_repaint();
+                }
                 let focused = ctx.input(|i| i.viewport().focused);
                 if focused == Some(true) {
                     self.overflow_seen_focus = true;
@@ -1235,13 +1723,14 @@ impl ShellApp {
         let size = vec2(380.0, 104.0);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Notification")
+            .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
             .with_active(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size(size)
-            .with_position([screen.x - size.x - 10.0, screen.y - PANEL_H - size.y - 10.0]);
+            .with_position([screen.x - size.x - 10.0, screen.y - self.lift - PANEL_H - size.y - 10.0]);
 
         let mut clicked = false;
         let mut dismissed = false;
@@ -1249,6 +1738,10 @@ impl ShellApp {
             ViewportId::from_hash_of("delfin_balloon"),
             builder,
             |ctx, _| {
+                // Created hidden; shown as a tool window so no taskbar button flashes.
+                if !win::reveal_popup("Delfin Notification", false) {
+                    ctx.request_repaint();
+                }
                 egui::CentralPanel::default()
                     .frame(
                         Frame::none()
@@ -1261,7 +1754,7 @@ impl ShellApp {
                             ui.interact(ui.max_rect(), egui::Id::new("balloon_bg"), Sense::click());
                         ui.horizontal(|ui| {
                             let title = if b.title.is_empty() {
-                                "Notification"
+                                crate::i18n::tr("Notification")
                             } else {
                                 b.title.as_str()
                             };
@@ -1324,6 +1817,7 @@ impl ShellApp {
         let left = (x - size.x / 2.0).clamp(2.0, (screen.x - size.x - 2.0).max(2.0));
         let builder = ViewportBuilder::default()
             .with_title("Delfin Tooltip")
+            .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
@@ -1331,11 +1825,15 @@ impl ShellApp {
             .with_mouse_passthrough(true)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size(size)
-            .with_position([left, screen.y - PANEL_H - size.y - 4.0]);
+            .with_position([left, screen.y - self.lift - PANEL_H - size.y - 4.0]);
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("delfin_tooltip"),
             builder,
             |ctx, _| {
+                // Created hidden; shown as a tool window so no taskbar button flashes.
+                if !win::reveal_popup("Delfin Tooltip", false) {
+                    ctx.request_repaint();
+                }
                 egui::CentralPanel::default()
                     .frame(
                         Frame::none()
@@ -1358,7 +1856,7 @@ impl ShellApp {
             dirs_.push(d);
         }
         if let Ok(p) = std::env::var("PUBLIC") {
-            dirs_.push(PathBuf::from(p).join("Desktop"));
+            dirs_.push(PathBuf::from(p).join(crate::i18n::tr("Desktop")));
         }
         let mut items = Vec::new();
         for d in dirs_ {
@@ -1485,27 +1983,27 @@ impl ShellApp {
                         bg.context_menu(|ui| {
                             ui.set_min_width(220.0);
                             if let Some(d) = dirs::desktop_dir() {
-                                if ui.button("Open Desktop Folder").clicked() {
+                                if ui.button(crate::i18n::tr("Open Desktop Folder")).clicked() {
                                     actions.push(DeskAction::Open(d.clone(), true));
                                     ui.close_menu();
                                 }
-                                if ui.button("Open Terminal Here").clicked() {
+                                if ui.button(crate::i18n::tr("Open Terminal Here")).clicked() {
                                     actions.push(DeskAction::Terminal(d));
                                     ui.close_menu();
                                 }
                             }
-                            if ui.button("Refresh").clicked() {
+                            if ui.button(crate::i18n::tr("Refresh")).clicked() {
                                 actions.push(DeskAction::Refresh);
                                 ui.close_menu();
                             }
                             ui.separator();
-                            if ui.button("Change Wallpaper…").clicked() {
+                            if ui.button(crate::i18n::tr("Change Wallpaper…")).clicked() {
                                 actions.push(DeskAction::Uri(
                                     "ms-settings:personalization-background",
                                 ));
                                 ui.close_menu();
                             }
-                            if ui.button("Display Settings…").clicked() {
+                            if ui.button(crate::i18n::tr("Display Settings…")).clicked() {
                                 actions.push(DeskAction::Uri("ms-settings:display"));
                                 ui.close_menu();
                             }
@@ -1563,20 +2061,20 @@ impl ShellApp {
                             }
                             resp.context_menu(|ui| {
                                 ui.set_min_width(200.0);
-                                if ui.button("Open").clicked() {
+                                if ui.button(crate::i18n::tr("Open")).clicked() {
                                     actions.push(DeskAction::Open(it.path.clone(), it.is_dir));
                                     ui.close_menu();
                                 }
-                                if !it.is_dir && ui.button("Show in Delfin").clicked() {
+                                if !it.is_dir && ui.button(crate::i18n::tr("Show in Delfin")).clicked() {
                                     actions.push(DeskAction::ShowInDelfin(it.path.clone()));
                                     ui.close_menu();
                                 }
-                                if it.is_dir && ui.button("Open Terminal Here").clicked() {
+                                if it.is_dir && ui.button(crate::i18n::tr("Open Terminal Here")).clicked() {
                                     actions.push(DeskAction::Terminal(it.path.clone()));
                                     ui.close_menu();
                                 }
                                 ui.separator();
-                                if ui.button("Move to Trash").clicked() {
+                                if ui.button(crate::i18n::tr("Move to Trash")).clicked() {
                                     actions.push(DeskAction::Trash(it.path.clone()));
                                     ui.close_menu();
                                 }
@@ -1598,7 +2096,7 @@ impl ShellApp {
             match a {
                 DeskAction::Open(p, true) => win::spawn_self(Some(&p)),
                 DeskAction::Open(p, false) => {
-                    let _ = open::that(&p);
+                    win::shell_open(&p);
                 }
                 DeskAction::ShowInDelfin(p) => {
                     if let Some(parent) = p.parent() {
@@ -1618,7 +2116,7 @@ impl ShellApp {
                     self.wallpaper_path = None;
                 }
                 DeskAction::Uri(u) => {
-                    let _ = open::that(u);
+                    win::shell_open(u);
                 }
             }
         }
@@ -1631,6 +2129,16 @@ impl eframe::App for ShellApp {
         self.place_panel(ctx);
         self.poll();
         self.poll_status();
+        self.adopt_tray(ctx);
+        if let Ok(list) = self.descriptions.try_recv() {
+            for (path, desc) in list {
+                for a in self.apps.iter_mut() {
+                    if matches!(&a.target, Launch::Path(p) if *p == path) {
+                        a.desc = desc.clone();
+                    }
+                }
+            }
+        }
         if let Ok(store) = self.store_apps.try_recv() {
             startmenu::merge_store_apps(&mut self.apps, store);
         }
@@ -1654,8 +2162,14 @@ impl eframe::App for ShellApp {
         if self.overflow_open {
             self.overflow_viewport(ctx, &pal);
         }
-        if self.quick_open {
-            self.quick_viewport(ctx, &pal);
+        if let Some(section) = self.quick_open {
+            self.quick_viewport(ctx, &pal, section);
+        }
+        if self.calendar_open {
+            self.calendar_viewport(ctx, &pal);
+        }
+        if self.settings_open {
+            self.settings_viewport(ctx, &pal);
         }
         self.balloon_viewport(ctx, &pal);
         self.tooltip_viewport(ctx, &pal);
@@ -1763,11 +2277,13 @@ fn task_button(
     resp
 }
 
-fn clock(ui: &mut Ui, pal: &Palette) -> egui::Response {
+fn clock(ui: &mut Ui, open: bool, pal: &Palette) -> egui::Response {
     let now = chrono::Local::now();
     let (rect, resp) = ui.allocate_exact_size(vec2(78.0, 36.0), Sense::click());
     let p = ui.painter();
-    if resp.hovered() {
+    if open {
+        p.rect_filled(rect, 4.0, pal.select);
+    } else if resp.hovered() {
         p.rect_filled(rect, 4.0, pal.hover);
     }
     p.text(
@@ -1797,5 +2313,75 @@ impl Drop for ShellApp {
 fn allow_foreground(hwnd: isize) {
     unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(win::pid_of(hwnd));
+    }
+}
+
+/// The Delfin mark (same as the launcher button), at any size.
+fn paint_logo(p: &egui::Painter, c: egui::Pos2, r: f32, pal: &Palette) {
+    p.circle_filled(c, r, pal.accent);
+    for i in 0..3 {
+        let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / 3.0;
+        p.circle_filled(c + vec2(a.cos(), a.sin()) * r * 0.46, r * 0.2, Color32::WHITE);
+    }
+    p.circle_stroke(c, r * 0.46, Stroke::new(r * 0.1, Color32::WHITE));
+}
+
+/// Small coloured glyph for each launcher category.
+fn paint_category(p: &egui::Painter, r: Rect, cat: Category, pal: &Palette) {
+    let c = r.center();
+    let s = r.width() / 2.0;
+    let blue = Color32::from_rgb(0x3d, 0xae, 0xe9);
+    match cat {
+        Category::All => {
+            for (i, j) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                let cell = Rect::from_min_size(r.min + vec2(i * s, j * s), vec2(s, s)).shrink(1.5);
+                p.rect_filled(cell, 2.5, blue);
+            }
+        }
+        Category::Office => {
+            let page = Rect::from_center_size(c, vec2(s * 1.4, s * 1.9));
+            p.rect_filled(page, 2.0, Color32::from_rgb(0x1d, 0x99, 0xf3));
+            for k in 0..3 {
+                let y = page.top() + s * 0.5 + k as f32 * s * 0.4;
+                p.line_segment([pos2(page.left() + 3.0, y), pos2(page.right() - 3.0, y)], Stroke::new(1.2_f32, Color32::WHITE));
+            }
+        }
+        Category::Graphics => {
+            p.circle_filled(c, s * 0.95, Color32::from_rgb(0xf6, 0x9a, 0x2e));
+            for (k, col) in [(0.0f32, 0xda4453u32), (2.1, 0x27ae60), (4.2, 0x3daee9)] {
+                let d = vec2(k.cos(), k.sin()) * s * 0.48;
+                p.circle_filled(c + d, s * 0.2, Color32::from_rgb((col >> 16) as u8, (col >> 8) as u8, col as u8));
+            }
+        }
+        Category::Internet => {
+            let st = Stroke::new(1.4_f32, Color32::from_rgb(0x1a, 0xbc, 0x9c));
+            p.circle_stroke(c, s * 0.9, st);
+            p.line_segment([c - vec2(s * 0.9, 0.0), c + vec2(s * 0.9, 0.0)], st);
+            p.add(Shape::ellipse_stroke(c, vec2(s * 0.4, s * 0.9), st));
+        }
+        Category::Multimedia => {
+            p.add(Shape::convex_polygon(
+                vec![c + vec2(-s * 0.6, -s * 0.8), c + vec2(s * 0.85, 0.0), c + vec2(-s * 0.6, s * 0.8)],
+                Color32::from_rgb(0x8e, 0x44, 0xad),
+                Stroke::NONE,
+            ));
+        }
+        Category::System => icons::paint_tool(p, r, Tool::Gear, pal.text),
+        Category::Games => {
+            let body = Rect::from_center_size(c, vec2(s * 1.9, s * 1.1));
+            p.rect_filled(body, s * 0.5, Color32::from_rgb(0x27, 0xae, 0x60));
+            let st = Stroke::new(1.4_f32, Color32::WHITE);
+            let l = c - vec2(s * 0.5, 0.0);
+            p.line_segment([l - vec2(s * 0.25, 0.0), l + vec2(s * 0.25, 0.0)], st);
+            p.line_segment([l - vec2(0.0, s * 0.25), l + vec2(0.0, s * 0.25)], st);
+            p.circle_filled(c + vec2(s * 0.45, -s * 0.12), 1.6, Color32::WHITE);
+            p.circle_filled(c + vec2(s * 0.7, s * 0.12), 1.6, Color32::WHITE);
+        }
+        Category::Recent => {
+            let st = Stroke::new(1.4_f32, pal.text);
+            p.circle_stroke(c, s * 0.9, st);
+            p.line_segment([c, c - vec2(0.0, s * 0.55)], st);
+            p.line_segment([c, c + vec2(s * 0.4, s * 0.2)], st);
+        }
     }
 }

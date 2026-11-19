@@ -33,6 +33,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_WiFi",
     "Win32_NetworkManagement_Ndis",
     "Win32_Devices_Display",
+    "Win32_Globalization",
 ] }
 
 [profile.release]

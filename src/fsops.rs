@@ -247,7 +247,7 @@ pub fn paste(paths: &[PathBuf], dest: &Path, cut: bool) -> Result<String, String
     }
     Ok(format!(
         "{} {n} item(s)",
-        if cut { "Moved" } else { "Copied" }
+        if cut { crate::i18n::tr("Moved") } else { crate::i18n::tr("Copied") }
     ))
 }
 
@@ -255,5 +255,5 @@ pub fn delete_permanently(paths: &[PathBuf]) -> Result<String, String> {
     for p in paths {
         remove_path(p).map_err(|e| format!("{}: {e}", p.display()))?;
     }
-    Ok(format!("Deleted {} item(s)", paths.len()))
+    Ok(crate::i18n::trf("Deleted {} item(s)", &[&paths.len()]))
 }

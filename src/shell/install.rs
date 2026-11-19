@@ -68,7 +68,7 @@ pub fn uninstall_shell() -> Result<String, String> {
         }
     }
     set_folder_handler(false)?;
-    Ok("Windows Explorer is the shell again. Sign out and back in to switch.".into())
+    Ok(crate::i18n::tr("Windows Explorer is the shell again. Sign out and back in to switch.").into())
 }
 
 pub fn folder_handler_set() -> bool {
@@ -89,7 +89,7 @@ pub fn set_folder_handler(on: bool) -> Result<(), String> {
             let (k, _) = hkcu.create_subkey(&base).map_err(e)?;
             k.set_value("", &"delfin").map_err(e)?;
             let (verb, _) = hkcu.create_subkey(format!(r"{base}\delfin")).map_err(e)?;
-            verb.set_value("", &"Open in Delfin").map_err(e)?;
+            verb.set_value("", &crate::i18n::tr("Open in Delfin")).map_err(e)?;
             let (cmd, _) = hkcu
                 .create_subkey(format!(r"{base}\delfin\command"))
                 .map_err(e)?;

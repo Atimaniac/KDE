@@ -11,7 +11,9 @@ pub struct Drive {
 
 /// Open a file with its default application.
 pub fn open(p: &Path) -> Result<(), String> {
-    open::that(p).map_err(|e| format!("Cannot open {}: {e}", p.display()))
+    // Detached: `open::that` waits for the PowerShell helper it starts, which
+    // froze the window for a second or two on every double-click.
+    open::that_detached(p).map_err(|e| crate::i18n::trf("Cannot open {}: {}", &[&p.display(), &e]))
 }
 
 // ---------------------------------------------------------------- Windows
@@ -85,10 +87,10 @@ mod imp {
             };
             if label.is_empty() {
                 label = match dtype {
-                    2 => "Removable Disk",
-                    4 => "Network Drive",
-                    5 => "CD/DVD Drive",
-                    _ => "Local Disk",
+                    2 => crate::i18n::tr("Removable Disk"),
+                    4 => crate::i18n::tr("Network Drive"),
+                    5 => crate::i18n::tr("CD/DVD Drive"),
+                    _ => crate::i18n::tr("Local Disk"),
                 }
                 .to_string();
             }
@@ -113,7 +115,7 @@ mod imp {
             .creation_flags(CREATE_NEW_CONSOLE)
             .spawn()
             .map(|_| ())
-            .map_err(|e| format!("Cannot open terminal: {e}"))
+            .map_err(|e| crate::i18n::trf("Cannot open terminal: {}", &[&e]))
     }
 }
 

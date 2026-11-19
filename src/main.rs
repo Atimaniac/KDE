@@ -4,16 +4,22 @@
 mod app;
 mod config;
 mod fsops;
+mod i18n;
 mod icons;
 mod platform;
 #[cfg(windows)]
 mod shell;
 mod theme;
+#[cfg(windows)]
+mod update;
 
 use eframe::egui;
 use std::path::PathBuf;
 
 fn main() -> Result<(), eframe::Error> {
+    // Delete the exe an earlier update replaced (it was still running then).
+    #[cfg(windows)]
+    update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
 

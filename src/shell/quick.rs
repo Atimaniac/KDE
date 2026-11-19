@@ -397,7 +397,7 @@ unsafe fn wifi_thread(ctx: egui::Context, rx: Receiver<WifiCmd>, state: Arc<Mute
                     };
                     let r = WlanSetInterface(h, &g, 4, size_of::<WLAN_PHY_RADIO_STATE>() as u32, &st as *const _ as *const c_void, null());
                     if r != 0 {
-                        status = Some("Windows didn't allow switching Wi-Fi (try Settings).".into());
+                        status = Some(crate::i18n::tr("Windows didn't allow switching Wi-Fi (try Settings).").into());
                     }
                 }
                 WifiCmd::Connect { net, password } => {
@@ -412,12 +412,12 @@ unsafe fn wifi_thread(ctx: egui::Context, rx: Receiver<WifiCmd>, state: Arc<Mute
                                     profile = net.ssid.clone();
                                 } else {
                                     ok = false;
-                                    status = Some(format!("Couldn't save the settings for {}.", net.ssid));
+                                    status = Some(crate::i18n::trf("Couldn't save the settings for {}.", &[&net.ssid]));
                                 }
                             }
                             None => {
                                 ok = false;
-                                status = Some(format!("{} needs Windows Settings to connect.", net.ssid));
+                                status = Some(crate::i18n::trf("{} needs Windows Settings to connect.", &[&net.ssid]));
                             }
                         }
                     }
@@ -432,10 +432,10 @@ unsafe fn wifi_thread(ctx: egui::Context, rx: Receiver<WifiCmd>, state: Arc<Mute
                             dwFlags: 0,
                         };
                         if WlanConnect(h, &g, &params, null()) == 0 {
-                            status = Some(format!("Connecting to {}…", net.ssid));
+                            status = Some(crate::i18n::trf("Connecting to {}…", &[&net.ssid]));
                             pending = Some((net.ssid.clone(), Instant::now()));
                         } else {
-                            status = Some(format!("Couldn't connect to {}.", net.ssid));
+                            status = Some(crate::i18n::trf("Couldn't connect to {}.", &[&net.ssid]));
                         }
                     }
                 }
@@ -492,7 +492,7 @@ unsafe fn wifi_thread(ctx: egui::Context, rx: Receiver<WifiCmd>, state: Arc<Mute
                 status = Some(String::new());
                 pending = None;
             } else if t.elapsed() > Duration::from_secs(20) {
-                status = Some(format!("Couldn't connect to {ssid}. Check the password."));
+                status = Some(crate::i18n::trf("Couldn't connect to {}. Check the password.", &[ssid]));
                 pending = None;
             }
         }
@@ -511,6 +511,24 @@ unsafe fn wifi_thread(ctx: egui::Context, rx: Receiver<WifiCmd>, state: Arc<Mute
 }
 
 // ------------------------------------------------------------------ the panel
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Section {
+    /// Volume, brightness, media keys, battery.
+    Sound,
+    /// Wi-Fi on/off and the list of networks.
+    Network,
+}
+
+impl Section {
+    /// Panel height in points.
+    pub fn height(self) -> f32 {
+        match self {
+            Section::Sound => 250.0,
+            Section::Network => 480.0,
+        }
+    }
+}
 
 pub enum QuickAction {
     Open(&'static str),
@@ -558,16 +576,66 @@ impl QuickPanel {
     }
 
     /// Signal of the connected Wi-Fi network, for the taskbar icon.
+    /// Name of the connected Wi-Fi network, for the tooltip.
+    pub fn connected_ssid(&self) -> Option<String> {
+        let s = self.wifi.state.lock().unwrap();
+        s.networks.iter().find(|n| n.connected).map(|n| n.ssid.clone())
+    }
+
     pub fn wifi_signal(&self) -> Option<u32> {
         let s = self.wifi.state.lock().unwrap();
         s.networks.iter().find(|n| n.connected).map(|n| n.signal)
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, pal: &Palette) -> Option<QuickAction> {
+    /// Change the volume by `delta` (0..1 scale), e.g. from the mouse wheel.
+    pub fn nudge_volume(&self, delta: f32) {
+        if let Some(v) = &self.vol {
+            v.set_level(v.level() + delta);
+            if v.muted() && delta > 0.0 {
+                v.set_muted(false);
+            }
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, pal: &Palette, section: Section) -> Option<QuickAction> {
         let mut action = None;
         ui.spacing_mut().slider_width = ui.available_width() - 90.0;
         ui.add_space(4.0);
+        if section == Section::Sound {
+            self.sound_ui(ui, pal);
+        } else {
+            self.network_ui(ui, pal, &mut action);
+        }
 
+        // Footer
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let links: &[(&str, &'static str)] = match section {
+                    Section::Sound => &[(crate::i18n::tr("Sound"), "ms-settings:sound"), (crate::i18n::tr("Volume Mixer"), "ms-settings:apps-volume")],
+                    Section::Network => &[(crate::i18n::tr("Network"), "ms-settings:network"), (crate::i18n::tr("Bluetooth"), "ms-settings:bluetooth")],
+                };
+                for &(label, uri) in links {
+                    if ui.button(label).clicked() {
+                        action = Some(QuickAction::Open(uri));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(crate::i18n::tr("All Settings")).clicked() {
+                        action = Some(QuickAction::Open("ms-settings:"));
+                    }
+                });
+            });
+            ui.separator();
+        });
+
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            action = Some(QuickAction::Close);
+        }
+        action
+    }
+
+    fn sound_ui(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         // Volume
         if let Some(v) = &self.vol {
             let muted = v.muted();
@@ -578,7 +646,7 @@ impl QuickPanel {
                     ui.painter().rect_filled(r, 4.0, pal.hover);
                 }
                 paint_speaker(ui.painter(), r, pal.text, if muted { None } else { Some(level / 100.0) });
-                if resp.on_hover_text(if muted { "Unmute" } else { "Mute" }).clicked() {
+                if resp.on_hover_text(if muted { crate::i18n::tr("Unmute") } else { crate::i18n::tr("Mute") }).clicked() {
                     v.set_muted(!muted);
                 }
                 if ui.add(egui::Slider::new(&mut level, 0.0..=100.0).show_value(false)).changed() {
@@ -613,16 +681,21 @@ impl QuickPanel {
                 let (r, resp) = ui.allocate_exact_size(vec2(44.0, 32.0), Sense::click());
                 ui.painter().rect_filled(r, 4.0, if resp.hovered() { pal.hover } else { pal.header });
                 paint_media(ui.painter(), r, k, pal.text);
-                let tip = ["Previous", "Play / Pause", "Next"][k];
+                let tip = [crate::i18n::tr("Previous"), crate::i18n::tr("Play / Pause"), crate::i18n::tr("Next")][k];
                 if resp.on_hover_text(tip).clicked() {
                     media_key(vk);
                 }
             }
         });
 
-        ui.add_space(4.0);
-        ui.separator();
+        // Battery (laptops)
+        if let Some((pct, charging)) = battery() {
+            ui.add_space(6.0);
+            ui.label(crate::i18n::trf("Battery {}%{}", &[&pct, &if charging { crate::i18n::tr(" (charging)") } else { "" }]));
+        }
+    }
 
+    fn network_ui(&mut self, ui: &mut egui::Ui, pal: &Palette, action: &mut Option<QuickAction>) {
         // Wi-Fi
         let (present, radio_on, nets, status) = {
             let s = self.wifi.state.lock().unwrap();
@@ -636,24 +709,24 @@ impl QuickPanel {
                     if toggle(ui, &mut on, pal).changed() {
                         self.wifi.set_radio(on);
                     }
-                    if radio_on && ui.small_button("⟳").on_hover_text("Scan again").clicked() {
+                    if radio_on && ui.small_button("⟳").on_hover_text(crate::i18n::tr("Scan again")).clicked() {
                         self.wifi.scan();
                     }
                 }
             });
         });
         if !present {
-            ui.label(egui::RichText::new("No Wi-Fi adapter found.").color(pal.dim));
+            ui.label(egui::RichText::new(crate::i18n::tr("No Wi-Fi adapter found.")).color(pal.dim));
         } else if !radio_on {
-            ui.label(egui::RichText::new("Wi-Fi is off.").color(pal.dim));
+            ui.label(egui::RichText::new(crate::i18n::tr("Wi-Fi is off.")).color(pal.dim));
         } else {
             egui::ScrollArea::vertical()
                 .id_salt("wifi-list")
-                .max_height(260.0)
+                .max_height(330.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     if nets.is_empty() {
-                        ui.label(egui::RichText::new("Looking for networks…").color(pal.dim));
+                        ui.label(egui::RichText::new(crate::i18n::tr("Looking for networks…")).color(pal.dim));
                     }
                     for net in &nets {
                         let open = self.expanded.as_deref() == Some(net.ssid.as_str());
@@ -671,10 +744,10 @@ impl QuickPanel {
                         let tx = ir.right() + 10.0;
                         ui.painter().text(pos2(tx, r.top() + 5.0), egui::Align2::LEFT_TOP, &net.ssid, FontId::proportional(13.5), pal.text);
                         let sub = match (net.connected, net.secured) {
-                            (true, true) => "Connected, secured",
-                            (true, false) => "Connected, open",
-                            (false, true) => "Secured",
-                            (false, false) => "Open",
+                            (true, true) => crate::i18n::tr("Connected, secured"),
+                            (true, false) => crate::i18n::tr("Connected, open"),
+                            (false, true) => crate::i18n::tr("Secured"),
+                            (false, false) => crate::i18n::tr("Open"),
                         };
                         ui.painter().text(pos2(tx, r.top() + 23.0), egui::Align2::LEFT_TOP, sub, FontId::proportional(11.0), pal.dim);
                         if resp.clicked() {
@@ -684,18 +757,18 @@ impl QuickPanel {
                         if open {
                             ui.add_space(4.0);
                             if net.connected {
-                                if ui.button("Disconnect").clicked() {
+                                if ui.button(crate::i18n::tr("Disconnect")).clicked() {
                                     self.wifi.disconnect();
                                     self.expanded = None;
                                 }
                             } else if !net.profile.is_empty() || !net.secured {
-                                if ui.button("Connect").clicked() {
+                                if ui.button(crate::i18n::tr("Connect")).clicked() {
                                     self.wifi.connect(net.clone(), None);
                                 }
                             } else if net.security().is_none() {
-                                ui.label(egui::RichText::new("This network needs Windows Settings.").color(pal.dim));
-                                if ui.button("Open Wi-Fi Settings").clicked() {
-                                    action = Some(QuickAction::Open("ms-settings:network-wifi"));
+                                ui.label(egui::RichText::new(crate::i18n::tr("This network needs Windows Settings.")).color(pal.dim));
+                                if ui.button(crate::i18n::tr("Open Wi-Fi Settings")).clicked() {
+                                    *action = Some(QuickAction::Open("ms-settings:network-wifi"));
                                 }
                             } else {
                                 let mut go = false;
@@ -703,11 +776,11 @@ impl QuickPanel {
                                     let te = ui.add(
                                         egui::TextEdit::singleline(&mut self.password)
                                             .password(true)
-                                            .hint_text("Password")
+                                            .hint_text(crate::i18n::tr("Password"))
                                             .desired_width(ui.available_width() - 90.0),
                                     );
                                     go |= te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    go |= ui.add_enabled(self.password.len() >= 8, egui::Button::new("Connect")).clicked();
+                                    go |= ui.add_enabled(self.password.len() >= 8, egui::Button::new(crate::i18n::tr("Connect"))).clicked();
                                 });
                                 if go && self.password.len() >= 8 {
                                     self.wifi.connect(net.clone(), Some(std::mem::take(&mut self.password)));
@@ -721,39 +794,6 @@ impl QuickPanel {
         if !status.is_empty() {
             ui.label(egui::RichText::new(status).color(pal.dim).size(12.0));
         }
-
-        // Battery
-        if let Some((pct, charging)) = battery() {
-            ui.separator();
-            ui.label(format!("Battery {pct}%{}", if charging { " (charging)" } else { "" }));
-        }
-
-        // Footer
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                if ui.button("Network").clicked() {
-                    action = Some(QuickAction::Open("ms-settings:network"));
-                }
-                if ui.button("Sound").clicked() {
-                    action = Some(QuickAction::Open("ms-settings:sound"));
-                }
-                if ui.button("Bluetooth").clicked() {
-                    action = Some(QuickAction::Open("ms-settings:bluetooth"));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("All Settings").clicked() {
-                        action = Some(QuickAction::Open("ms-settings:"));
-                    }
-                });
-            });
-            ui.separator();
-        });
-
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            action = Some(QuickAction::Close);
-        }
-        action
     }
 }
 

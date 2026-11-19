@@ -72,25 +72,25 @@ pub fn kind_color(k: Kind) -> Color32 {
 pub fn type_name(ext: &str, is_dir: bool) -> String {
     let up = ext.to_uppercase();
     match kind_of(ext, is_dir) {
-        Kind::Folder => "Folder".into(),
-        Kind::Image => format!("{up} image"),
-        Kind::Video => format!("{up} video"),
-        Kind::Audio => format!("{up} audio"),
-        Kind::Archive => format!("{up} archive"),
-        Kind::Pdf => "PDF document".into(),
-        Kind::Doc => format!("{up} document"),
-        Kind::Sheet => format!("{up} spreadsheet"),
-        Kind::Slides => format!("{up} presentation"),
-        Kind::Code => format!("{up} source"),
+        Kind::Folder => crate::i18n::tr("Folder").into(),
+        Kind::Image => crate::i18n::trf("{} image", &[&up]),
+        Kind::Video => crate::i18n::trf("{} video", &[&up]),
+        Kind::Audio => crate::i18n::trf("{} audio", &[&up]),
+        Kind::Archive => crate::i18n::trf("{} archive", &[&up]),
+        Kind::Pdf => crate::i18n::tr("PDF document").into(),
+        Kind::Doc => crate::i18n::trf("{} document", &[&up]),
+        Kind::Sheet => crate::i18n::trf("{} spreadsheet", &[&up]),
+        Kind::Slides => crate::i18n::trf("{} presentation", &[&up]),
+        Kind::Code => crate::i18n::trf("{} source", &[&up]),
         Kind::Exe => match ext {
-            "exe" | "msi" | "appimage" => "Application".into(),
-            "lnk" => "Shortcut".into(),
-            "dll" | "sys" => "System file".into(),
-            _ => "Script".into(),
+            "exe" | "msi" | "appimage" => crate::i18n::tr("Application").into(),
+            "lnk" => crate::i18n::tr("Shortcut").into(),
+            "dll" | "sys" => crate::i18n::tr("System file").into(),
+            _ => crate::i18n::tr("Script").into(),
         },
-        Kind::Text => format!("{up} text"),
-        Kind::Other if ext.is_empty() => "File".into(),
-        Kind::Other => format!("{up} file"),
+        Kind::Text => crate::i18n::trf("{} text", &[&up]),
+        Kind::Other if ext.is_empty() => crate::i18n::tr("File").into(),
+        Kind::Other => crate::i18n::trf("{} file", &[&up]),
     }
 }
 
