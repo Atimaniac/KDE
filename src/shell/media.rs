@@ -64,6 +64,7 @@ impl Track {
 
 pub enum Cmd {
     TogglePlay,
+    Stop,
     Next,
     Prev,
     Shuffle(bool),
@@ -219,6 +220,7 @@ fn snapshot(session: &Session, prev: Option<&Track>, gen: &mut u64) -> Option<Tr
 fn run(session: &Session, cmd: Cmd) {
     let ok = match cmd {
         Cmd::TogglePlay => session.TryTogglePlayPauseAsync().and_then(|op| op.join()),
+        Cmd::Stop => session.TryStopAsync().and_then(|op| op.join()),
         Cmd::Next => session.TrySkipNextAsync().and_then(|op| op.join()),
         Cmd::Prev => session.TrySkipPreviousAsync().and_then(|op| op.join()),
         Cmd::Shuffle(on) => session.TryChangeShuffleActiveAsync(on).and_then(|op| op.join()),

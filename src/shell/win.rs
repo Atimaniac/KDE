@@ -634,6 +634,10 @@ pub enum Hotkey {
     Switch(SwitchKey),
     /// Ctrl+Shift+Esc.
     TaskManager,
+    /// Keyboard media keys: next, previous, play / pause, stop.
+    Media(MediaKey),
+    /// Keyboard volume keys (also volume knobs and sliders): +1 up, -1 down, 0 mute.
+    Volume(i8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -649,7 +653,29 @@ pub enum SwitchKey {
 /// The window switcher is on screen: the keyboard hook then also takes the
 /// arrows, Enter and Esc (the switcher never takes the keyboard focus).
 pub static SWITCHER_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static HOOK_OUT: std::sync::OnceLock<(std::sync::Mutex<Sender<Hotkey>>, egui::Context)> = std::sync::OnceLock::new();
+static MEDIA_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Explorer is running: it handles the media and volume keys itself.
+pub static EXPLORER_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaKey {
+    Next,
+    Prev,
+    PlayPause,
+    Stop,
+}
+
+/// From the keyboard hook. Only queues the key: the hook must answer within
+/// ~1 s or Windows silently removes it, so it never waits for the UI thread.
+fn hook_send(h: Hotkey) {
+    if let Some(tx) = HOOK_OUT.get() {
+        if let Ok(t) = tx.try_lock() {
+            let _ = t.send(h);
+        }
+    }
+}
+static HOOK_OUT: std::sync::OnceLock<std::sync::Mutex<Sender<Hotkey>>> = std::sync::OnceLock::new();
 
 /// Low-level keyboard hook: Alt+Tab opens Delfin's switcher instead of the
 /// Windows one, then Tab / arrows move, Enter switches, Esc cancels.
@@ -669,18 +695,37 @@ unsafe extern "system" fn switch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
         // The key itself must pass through, or Windows would think Alt is
         // still held down.
         if open && up && matches!(k.vkCode, 0x12 | 0xA4 | 0xA5) {
-            if let Some((tx, ctx)) = HOOK_OUT.get() {
-                let _ = tx.lock().map(|t| t.send(Hotkey::Switch(SwitchKey::Confirm)));
-                ctx.request_repaint();
-            }
+            hook_send(Hotkey::Switch(SwitchKey::Confirm));
             return CallNextHookEx(null_mut(), code, wp, lp);
+        }
+        // Media and volume keys. Without Explorer nobody else reacts to them.
+        if !EXPLORER_PRESENT.load(Ordering::Relaxed) {
+            let action = match k.vkCode {
+                0xB0 => Some(Hotkey::Media(MediaKey::Next)),
+                0xB1 => Some(Hotkey::Media(MediaKey::Prev)),
+                0xB2 => Some(Hotkey::Media(MediaKey::Stop)),
+                0xB3 => Some(Hotkey::Media(MediaKey::PlayPause)),
+                0xAF => Some(Hotkey::Volume(1)),
+                0xAE => Some(Hotkey::Volume(-1)),
+                0xAD => Some(Hotkey::Volume(0)),
+                _ => None,
+            };
+            if let Some(a) = action {
+                // Volume repeats while held; media keys only on the first press.
+                let media = matches!(a, Hotkey::Media(_));
+                let repeat = k.flags & 0x80 == 0 && MEDIA_DOWN.swap(down, Ordering::Relaxed) && down;
+                if down && !(media && repeat) {
+                    hook_send(a);
+                }
+                if !down {
+                    MEDIA_DOWN.store(false, Ordering::Relaxed);
+                }
+                return 1;
+            }
         }
         // Ctrl+Shift+Esc: Delfin's task manager.
         if down && !open && k.vkCode == 0x1B && GetAsyncKeyState(0x11) < 0 && shift {
-            if let Some((tx, ctx)) = HOOK_OUT.get() {
-                let _ = tx.lock().map(|t| t.send(Hotkey::TaskManager));
-                ctx.request_repaint();
-            }
+            hook_send(Hotkey::TaskManager);
             return 1;
         }
         let key = match k.vkCode {
@@ -695,10 +740,7 @@ unsafe extern "system" fn switch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
         };
         if let Some(key) = key {
             if down {
-                if let Some((tx, ctx)) = HOOK_OUT.get() {
-                    let _ = tx.lock().map(|t| t.send(Hotkey::Switch(key)));
-                    ctx.request_repaint();
-                }
+                hook_send(Hotkey::Switch(key));
             }
             if down || up {
                 return 1; // swallow: Windows' own switcher never sees it
@@ -723,14 +765,35 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
         for (id, m, vk) in keys {
             RegisterHotKey(null_mut(), id, m, vk);
         }
-        let _ = HOOK_OUT.set((std::sync::Mutex::new(tx.clone()), ctx.clone()));
+        // Keys from the hook go through a forwarding thread, which wakes the UI.
+        let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<Hotkey>();
+        let _ = HOOK_OUT.set(std::sync::Mutex::new(fwd_tx));
         {
-            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-            use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowsHookExW;
-            SetWindowsHookExW(13 /* WH_KEYBOARD_LL */, Some(switch_hook), GetModuleHandleW(null()), 0);
+            let (tx, ctx) = (tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                while let Ok(k) = fwd_rx.recv() {
+                    let _ = tx.send(k);
+                    ctx.request_repaint();
+                }
+            });
         }
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetTimer, SetWindowsHookExW, UnhookWindowsHookEx};
+        let install = || SetWindowsHookExW(13 /* WH_KEYBOARD_LL */, Some(switch_hook), GetModuleHandleW(null()), 0);
+        let mut hook = install();
+        // Windows removes a low-level hook without telling anyone if it was ever
+        // too slow; put it back every 30 s to be safe.
+        SetTimer(null_mut(), 0, 30_000, None);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if msg.message == 0x0113 {
+                // WM_TIMER
+                if !hook.is_null() {
+                    UnhookWindowsHookEx(hook);
+                }
+                hook = install();
+                continue;
+            }
             if msg.message == 0x0312 {
                 let k = match msg.wParam {
                     1 => Hotkey::FileManager,

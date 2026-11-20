@@ -179,6 +179,8 @@ struct ShellApp {
     /// Live preview of the task button under the pointer.
     preview: Option<Preview>,
     preview_last_hover: Instant,
+    /// Volume pop-up after a volume key: when it was last shown.
+    osd: Option<Instant>,
     // what is playing (browser, Spotify, …) and its flyout
     media: media::Media,
     media_open: bool,
@@ -313,6 +315,7 @@ impl ShellApp {
             tray_checked: long_ago,
             preview: None,
             preview_last_hover: long_ago,
+            osd: None,
             media: media::Media::start(cc.egui_ctx.clone()),
             media_open: false,
             media_seen_focus: false,
@@ -849,6 +852,7 @@ impl ShellApp {
         self.vol_state = self.qp.volume_state();
         self.wifi_sig = self.qp.wifi_signal();
         self.wired = quick::wired_connected();
+        win::EXPLORER_PRESENT.store(win::explorer_running(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn quick_viewport(&mut self, ctx: &egui::Context, pal: &Palette, section: quick::Section) {
@@ -1931,7 +1935,6 @@ impl ShellApp {
             .with_resizable(false)
             .with_taskbar(false)
             .with_active(false)
-            .with_mouse_passthrough(true)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size(size)
             .with_position([left, screen.y - self.lift - PANEL_H - size.y - 4.0]);
@@ -2261,6 +2264,22 @@ impl eframe::App for ShellApp {
                 }
                 win::Hotkey::ShowDesktop => self.show_desktop(),
                 win::Hotkey::Switch(key) => self.switch_key(key),
+                win::Hotkey::Media(key) => self.media.send(match key {
+                    win::MediaKey::Next => media::Cmd::Next,
+                    win::MediaKey::Prev => media::Cmd::Prev,
+                    win::MediaKey::PlayPause => media::Cmd::TogglePlay,
+                    win::MediaKey::Stop => media::Cmd::Stop,
+                }),
+                win::Hotkey::Volume(step) => {
+                    if step == 0 {
+                        self.qp.toggle_mute();
+                    } else {
+                        // 2 % per step, like Windows.
+                        self.qp.nudge_volume(step as f32 * 0.02);
+                    }
+                    self.vol_state = self.qp.volume_state();
+                    self.osd = Some(Instant::now());
+                }
                 win::Hotkey::TaskManager => {
                     if let Ok(me) = std::env::current_exe() {
                         let _ = std::process::Command::new(me).arg("--taskmgr").spawn();
@@ -2292,6 +2311,9 @@ impl eframe::App for ShellApp {
         if self.preview.is_some() {
             self.preview_viewport(ctx, &pal);
         }
+        // Always there (hidden when idle): creating a window takes about a
+        // second, too slow for a pop-up that lives 1.5 s.
+        self.osd_viewport(ctx, &pal);
         if self.settings_open {
             self.settings_viewport(ctx, &pal);
         }
@@ -3242,5 +3264,72 @@ impl ShellApp {
                 self.last_fg = h;
             }
         }
+    }
+}
+
+// ----------------------------------------------------------------- volume pop-up
+
+const OSD_W: f32 = 300.0;
+const OSD_H: f32 = 56.0;
+const OSD_SHOW: f32 = 1.4;
+const OSD_FADE: f32 = 0.35;
+
+impl ShellApp {
+    /// Shown for a moment after a volume key, like the Windows volume flyout.
+    fn osd_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let age = self.osd.map(|s| s.elapsed().as_secs_f32());
+        if age.is_some_and(|a| a > OSD_SHOW + OSD_FADE) {
+            self.osd = None;
+        }
+        let active = self.osd.is_some();
+        let age = age.unwrap_or(0.0);
+        let alpha = if age < OSD_SHOW { 1.0 } else { 1.0 - (age - OSD_SHOW) / OSD_FADE };
+        if active {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+        let screen = Self::screen_points(ctx);
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Volume")
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([OSD_W, OSD_H])
+            .with_position([(screen.x - OSD_W) / 2.0, screen.y - self.lift - PANEL_H - OSD_H - 24.0]);
+        let (level, muted) = self.vol_state.unwrap_or((0.0, false));
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_osd"), builder, |ctx, _| {
+            // Never takes the focus away from what you're doing.
+            if !active {
+                if let Some(h) = win::find_window("Delfin Volume") {
+                    win::hide(h);
+                }
+                egui::CentralPanel::default().frame(Frame::none().fill(pal.window)).show(ctx, |_| {});
+                return;
+            }
+            if !win::reveal_popup("Delfin Volume", false) {
+                ctx.request_repaint();
+            }
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window.gamma_multiply(alpha)).stroke(Stroke::new(1.0_f32, pal.border.gamma_multiply(alpha))))
+                .show(ctx, |ui| {
+                    let r = ui.max_rect();
+                    let p = ui.painter();
+                    let icon = Rect::from_center_size(pos2(r.left() + 30.0, r.center().y), vec2(26.0, 26.0));
+                    quick::paint_speaker(p, icon, pal.text.gamma_multiply(alpha), if muted { None } else { Some(level) });
+                    let bar = Rect::from_min_max(pos2(icon.right() + 14.0, r.center().y - 2.0), pos2(r.right() - 58.0, r.center().y + 2.0));
+                    p.rect_filled(bar, 2.0, pal.border.gamma_multiply(alpha));
+                    let f = if muted { 0.0 } else { level.clamp(0.0, 1.0) };
+                    p.rect_filled(Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * f, bar.bottom())), 2.0, pal.accent.gamma_multiply(alpha));
+                    p.circle_filled(pos2(bar.left() + bar.width() * f, bar.center().y), 6.0, pal.accent.gamma_multiply(alpha));
+                    p.text(
+                        pos2(r.right() - 16.0, r.center().y),
+                        Align2::RIGHT_CENTER,
+                        if muted { "—".to_string() } else { format!("{:.0}", level * 100.0) },
+                        FontId::proportional(16.0),
+                        pal.text.gamma_multiply(alpha),
+                    );
+                });
+        });
     }
 }
