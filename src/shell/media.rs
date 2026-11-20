@@ -241,6 +241,7 @@ fn worker(ctx: egui::Context, out: Arc<Mutex<Option<Track>>>, rx: Receiver<Cmd>)
     }
     let mut manager: Option<Manager> = None;
     let mut gen = 0u64;
+    let mut missing_since: Option<Instant> = None;
     loop {
         if manager.is_none() {
             manager = Manager::RequestAsync().ok().and_then(|op| op.join().ok());
@@ -258,7 +259,19 @@ fn worker(ctx: egui::Context, out: Arc<Mutex<Option<Track>>>, rx: Receiver<Cmd>)
             std::thread::sleep(Duration::from_millis(150));
         }
         let prev = out.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let now = session.as_ref().and_then(|s| snapshot(s, prev.as_ref(), &mut gen));
+        let mut now = session.as_ref().and_then(|s| snapshot(s, prev.as_ref(), &mut gen));
+        // While a player changes tracks it briefly reports no title (or no
+        // session at all). Keep showing the last track for a few seconds so
+        // the panel element doesn't blink away and back.
+        match (&now, &prev) {
+            (None, Some(p)) => {
+                let since = *missing_since.get_or_insert_with(Instant::now);
+                if since.elapsed() < Duration::from_secs(4) {
+                    now = Some(p.clone());
+                }
+            }
+            _ => missing_since = None,
+        }
         let changed = match (&prev, &now) {
             (None, None) => false,
             (Some(a), Some(b)) => {

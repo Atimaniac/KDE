@@ -174,6 +174,9 @@ struct ShellApp {
     calendar_month: (i32, u32),
     /// Last time we looked for a missing tray (Explorer closed after we started).
     tray_checked: Instant,
+    /// Live preview of the task button under the pointer.
+    preview: Option<Preview>,
+    preview_last_hover: Instant,
     // what is playing (browser, Spotify, …) and its flyout
     media: media::Media,
     media_open: bool,
@@ -305,6 +308,8 @@ impl ShellApp {
             calendar_closed_at: long_ago,
             calendar_month: (2000, 1),
             tray_checked: long_ago,
+            preview: None,
+            preview_last_hover: long_ago,
             media: media::Media::start(cc.egui_ctx.clone()),
             media_open: false,
             media_seen_focus: false,
@@ -1029,6 +1034,7 @@ impl ShellApp {
 
     fn panel_ui(&mut self, ctx: &egui::Context, pal: &Palette) {
         let mut actions: Vec<PanelAction> = Vec::new();
+        let mut task_hover: Option<(isize, f32)> = None;
         let mut hovered: Option<(String, f32)> = None;
         let mut hover_id: Option<(isize, u32)> = None;
         egui::CentralPanel::default()
@@ -1097,7 +1103,8 @@ impl ShellApp {
                             actions.push(PanelAction::Close(t.hwnd));
                         }
                         if r.hovered() {
-                            hovered = Some((t.title.clone(), r.rect.center().x));
+                            // A live preview instead of a text tooltip.
+                            task_hover = Some((t.hwnd, r.rect.center().x));
                         }
                     }
 
@@ -1227,6 +1234,7 @@ impl ShellApp {
                 });
             });
 
+        self.update_preview(task_hover);
         self.last_hover = hover_id;
         // Tooltip (drawn in its own small window above the panel).
         self.tip = match (hovered, self.tip.take()) {
@@ -1261,11 +1269,13 @@ impl ShellApp {
                     self.open_launcher(open);
                 }
                 PanelAction::Activate(h) => {
+                    self.preview = None;
                     win::activate(h);
                     self.last_fg = h;
                     self.hidden_for_desktop.clear();
                 }
                 PanelAction::Minimize(h) => {
+                    self.preview = None;
                     win::minimize(h);
                     self.last_fg = 0;
                 }
@@ -2265,6 +2275,9 @@ impl eframe::App for ShellApp {
         if self.media_open {
             self.media_viewport(ctx, &pal);
         }
+        if self.preview.is_some() {
+            self.preview_viewport(ctx, &pal);
+        }
         if self.settings_open {
             self.settings_viewport(ctx, &pal);
         }
@@ -3021,6 +3034,199 @@ impl ShellApp {
         if close {
             self.media_open = false;
             self.media_closed_at = Instant::now();
+        }
+    }
+}
+
+// ----------------------------------------------------------------- task previews
+
+const PREVIEW_W: f32 = 300.0;
+const PREVIEW_H: f32 = 214.0;
+const PREVIEW_DELAY: Duration = Duration::from_millis(400);
+const PREVIEW_TITLE: &str = "Delfin Preview";
+
+/// Hovering a task button shows a live DWM thumbnail of that window.
+struct Preview {
+    hwnd: isize,
+    /// Centre of the task button (points).
+    x: f32,
+    since: Instant,
+    thumb: Option<isize>,
+    thumb_for: isize,
+    pointer_inside: bool,
+}
+
+impl Drop for Preview {
+    fn drop(&mut self) {
+        if let Some(t) = self.thumb {
+            win::thumb_unregister(t);
+        }
+    }
+}
+
+impl ShellApp {
+    fn update_preview(&mut self, hover: Option<(isize, f32)>) {
+        if self.switcher.is_some() || self.launcher_open {
+            self.preview = None;
+            return;
+        }
+        let now = Instant::now();
+        match hover {
+            Some((h, x)) => {
+                self.preview_last_hover = now;
+                match &mut self.preview {
+                    Some(p) if p.hwnd == h => p.x = x,
+                    Some(p) => {
+                        // Moving along the panel: the preview follows at once.
+                        let shown = p.since.elapsed() >= PREVIEW_DELAY;
+                        p.hwnd = h;
+                        p.x = x;
+                        if !shown {
+                            p.since = now;
+                        }
+                    }
+                    None => {
+                        self.preview = Some(Preview { hwnd: h, x, since: now, thumb: None, thumb_for: 0, pointer_inside: false });
+                    }
+                }
+            }
+            None => {
+                let keep = self.preview.as_ref().is_some_and(|p| p.pointer_inside)
+                    || self.preview_last_hover.elapsed() < Duration::from_millis(300);
+                if !keep {
+                    self.preview = None;
+                }
+            }
+        }
+    }
+
+    fn preview_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(p) = &self.preview else { return };
+        let wait = PREVIEW_DELAY.saturating_sub(p.since.elapsed());
+        if !wait.is_zero() {
+            ctx.request_repaint_after(wait);
+            return;
+        }
+        if !win::is_window(p.hwnd) {
+            self.preview = None;
+            return;
+        }
+        let screen = Self::screen_points(ctx);
+        let x = (p.x - PREVIEW_W / 2.0).clamp(4.0, (screen.x - PREVIEW_W - 4.0).max(4.0));
+        let builder = ViewportBuilder::default()
+            .with_title(PREVIEW_TITLE)
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([PREVIEW_W, PREVIEW_H])
+            .with_position([x, screen.y - self.lift - PANEL_H - PREVIEW_H - 6.0]);
+        let ppp = ctx.pixels_per_point();
+        let task = self.tasks.iter().find(|t| t.hwnd == p.hwnd).cloned();
+        let icon = self.tex_window(ctx, p.hwnd);
+        let mut activate = false;
+        let mut close_window = false;
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_preview"), builder, |ctx, _| {
+            // Never takes the focus: the window you are looking at keeps it.
+            if !win::reveal_popup(PREVIEW_TITLE, false) {
+                ctx.request_repaint();
+                return;
+            }
+            let Some(p) = &mut self.preview else { return };
+            p.pointer_inside = ctx.input(|i| i.pointer.has_pointer());
+            // (Re)attach the thumbnail when the hovered window changes.
+            if p.thumb_for != p.hwnd {
+                if let Some(t) = p.thumb.take() {
+                    win::thumb_unregister(t);
+                }
+                if let Some(dest) = win::find_window(PREVIEW_TITLE) {
+                    p.thumb = win::thumb_register(dest, p.hwnd);
+                    p.thumb_for = p.hwnd;
+                }
+            }
+            let fade = ease_out((p.since.elapsed() - PREVIEW_DELAY).as_secs_f32() / 0.12);
+            if fade < 1.0 {
+                ctx.request_repaint();
+            }
+            let title = task.as_ref().map(|t| t.title.clone()).unwrap_or_default();
+            let minimized = task.as_ref().is_some_and(|t| t.minimized);
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window).stroke(Stroke::new(1.0_f32, pal.border)))
+                .show(ctx, |ui| {
+                    let full = ui.max_rect();
+                    let painter = ui.painter().clone();
+                    // Title row: icon, title, close.
+                    let row = Rect::from_min_size(full.min + vec2(10.0, 6.0), vec2(full.width() - 20.0, 24.0));
+                    let ir = Rect::from_min_size(pos2(row.left(), row.center().y - 8.0), vec2(16.0, 16.0));
+                    if let Some(t) = &icon {
+                        painter.image(t.id(), ir, uv_full(), Color32::WHITE.gamma_multiply(fade));
+                    }
+                    let xr = Rect::from_center_size(pos2(row.right() - 10.0, row.center().y), vec2(22.0, 22.0));
+                    painter.with_clip_rect(Rect::from_min_max(pos2(ir.right() + 6.0, row.top()), pos2(xr.left() - 4.0, row.bottom()))).text(
+                        pos2(ir.right() + 6.0, row.center().y),
+                        Align2::LEFT_CENTER,
+                        &title,
+                        FontId::proportional(12.5),
+                        pal.text.gamma_multiply(fade),
+                    );
+                    let xresp = ui.interact(xr, ui.id().with("preview-close"), Sense::click());
+                    if xresp.hovered() {
+                        painter.rect_filled(xr, 4.0, pal.danger);
+                    }
+                    let c = xr.center();
+                    let st = Stroke::new(1.4_f32, pal.text.gamma_multiply(fade));
+                    painter.line_segment([c + vec2(-4.0, -4.0), c + vec2(4.0, 4.0)], st);
+                    painter.line_segment([c + vec2(-4.0, 4.0), c + vec2(4.0, -4.0)], st);
+                    if xresp.clicked() {
+                        close_window = true;
+                    }
+
+                    // The window itself.
+                    let area = Rect::from_min_max(pos2(full.left() + 10.0, row.bottom() + 6.0), full.max - vec2(10.0, 10.0));
+                    let aresp = ui.interact(area, ui.id().with("preview-area"), Sense::click());
+                    if aresp.hovered() {
+                        painter.rect_filled(area.expand(4.0), 6.0, pal.hover);
+                    }
+                    if aresp.clicked() {
+                        activate = true;
+                    }
+                    let live = !minimized && p.thumb.is_some();
+                    if let Some(id) = p.thumb {
+                        let (sw, sh) = win::thumb_source_size(id);
+                        let fit = if sw > 0 && sh > 0 {
+                            let s = (area.width() * ppp / sw as f32).min(area.height() * ppp / sh as f32).min(1.0);
+                            Rect::from_center_size(area.center(), vec2(sw as f32 * s / ppp, sh as f32 * s / ppp))
+                        } else {
+                            area
+                        };
+                        win::thumb_update(
+                            id,
+                            [(fit.left() * ppp) as i32, (fit.top() * ppp) as i32, (fit.right() * ppp) as i32, (fit.bottom() * ppp) as i32],
+                            (255.0 * fade) as u8,
+                            live,
+                        );
+                    }
+                    if !live {
+                        let big = Rect::from_center_size(area.center(), vec2(48.0, 48.0));
+                        match &icon {
+                            Some(t) => {
+                                painter.image(t.id(), big, uv_full(), Color32::WHITE.gamma_multiply(fade));
+                            }
+                            None => icons::paint_tool(&painter, big, Tool::Desktop, pal.dim),
+                        }
+                    }
+                });
+        });
+        if activate || close_window {
+            let h = self.preview.as_ref().map(|p| p.hwnd).unwrap_or(0);
+            self.preview = None;
+            if close_window {
+                win::close(h);
+            } else {
+                win::activate(h);
+                self.last_fg = h;
+            }
         }
     }
 }
