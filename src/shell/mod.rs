@@ -8,6 +8,7 @@
 //! * File-manager windows are separate `delfin.exe` processes.
 
 pub mod install;
+mod media;
 mod quick;
 mod startmenu;
 mod startup;
@@ -82,6 +83,8 @@ enum Power {
 }
 
 enum PanelAction {
+    ToggleMedia,
+    Media(media::Cmd),
     ToggleLauncher,
     Activate(isize),
     Minimize(isize),
@@ -171,6 +174,14 @@ struct ShellApp {
     calendar_month: (i32, u32),
     /// Last time we looked for a missing tray (Explorer closed after we started).
     tray_checked: Instant,
+    // what is playing (browser, Spotify, …) and its flyout
+    media: media::Media,
+    media_open: bool,
+    media_seen_focus: bool,
+    media_closed_at: Instant,
+    /// Left edge of the panel widget, where the flyout opens.
+    media_x: f32,
+    media_tex: Option<(u64, TextureHandle)>,
     // Delfin settings window (language, updates, shell options)
     settings_open: bool,
     /// Alt+Tab window switcher, while it is on screen.
@@ -294,6 +305,12 @@ impl ShellApp {
             calendar_closed_at: long_ago,
             calendar_month: (2000, 1),
             tray_checked: long_ago,
+            media: media::Media::start(cc.egui_ctx.clone()),
+            media_open: false,
+            media_seen_focus: false,
+            media_closed_at: long_ago,
+            media_x: 0.0,
+            media_tex: None,
             settings_open: false,
             switcher: None,
             updater: crate::update::Updater::default(),
@@ -1049,6 +1066,16 @@ impl ShellApp {
                     }
                     ui.separator();
 
+                    // What is playing, with its own controls.
+                    if let Some(track) = self.media.current() {
+                        let (r, _) = ui.allocate_exact_size(vec2(340.0, 36.0), Sense::hover());
+                        self.media_x = r.left();
+                        self.media_widget(ui, ctx, r, &track, pal, &mut actions);
+                        ui.separator();
+                    } else if self.media_open {
+                        self.media_open = false;
+                    }
+
                     let right_w = 200.0;
                     let avail = (ui.available_width() - right_w).max(40.0);
                     let n = self.tasks.len().max(1) as f32;
@@ -1248,6 +1275,19 @@ impl ShellApp {
                     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"));
                     let _ = crate::platform::open_terminal(&home);
                 }
+                PanelAction::ToggleMedia => {
+                    if self.media_open {
+                        self.media_open = false;
+                        self.media_closed_at = Instant::now();
+                    } else if self.media_closed_at.elapsed() > Duration::from_millis(300) {
+                        self.open_quick(None);
+                        self.open_launcher(false);
+                        self.calendar_open = false;
+                        self.media_open = true;
+                        self.media_seen_focus = false;
+                    }
+                }
+                PanelAction::Media(c) => self.media.send(c),
                 PanelAction::ToggleCalendar => {
                     if self.calendar_open {
                         self.calendar_open = false;
@@ -2222,6 +2262,9 @@ impl eframe::App for ShellApp {
         if self.calendar_open {
             self.calendar_viewport(ctx, &pal);
         }
+        if self.media_open {
+            self.media_viewport(ctx, &pal);
+        }
         if self.settings_open {
             self.settings_viewport(ctx, &pal);
         }
@@ -2659,6 +2702,325 @@ impl ShellApp {
                 sw.sel = i;
             }
             self.switch_key(win::SwitchKey::Confirm);
+        }
+    }
+}
+
+// ----------------------------------------------------------------- media
+
+const MEDIA_W: f32 = 420.0;
+const MEDIA_H: f32 = 330.0;
+
+/// Small media glyphs: 0 prev, 1 play, 2 pause, 3 next, 4 shuffle, 5 repeat, 6 repeat one.
+fn paint_media_glyph(p: &egui::Painter, r: Rect, which: u8, col: Color32) {
+    let c = r.center();
+    let s = r.height() * 0.32;
+    let tri = |dir: f32, dx: f32| {
+        Shape::convex_polygon(
+            vec![c + vec2(dx - dir * s * 0.8, -s), c + vec2(dx + dir * s * 0.8, 0.0), c + vec2(dx - dir * s * 0.8, s)],
+            col,
+            Stroke::NONE,
+        )
+    };
+    let st = Stroke::new((s * 0.22).max(1.4), col);
+    match which {
+        0 => {
+            p.add(tri(-1.0, s * 0.25));
+            p.rect_filled(Rect::from_center_size(c + vec2(-s * 0.85, 0.0), vec2(s * 0.28, s * 2.0)), 1.0, col);
+        }
+        1 => {
+            p.add(tri(1.0, s * 0.2));
+        }
+        2 => {
+            p.rect_filled(Rect::from_center_size(c + vec2(-s * 0.42, 0.0), vec2(s * 0.42, s * 2.0)), 1.5, col);
+            p.rect_filled(Rect::from_center_size(c + vec2(s * 0.42, 0.0), vec2(s * 0.42, s * 2.0)), 1.5, col);
+        }
+        3 => {
+            p.add(tri(1.0, -s * 0.25));
+            p.rect_filled(Rect::from_center_size(c + vec2(s * 0.85, 0.0), vec2(s * 0.28, s * 2.0)), 1.0, col);
+        }
+        4 => {
+            // two crossing arrows
+            p.line_segment([c + vec2(-s, -s * 0.6), c + vec2(s, s * 0.6)], st);
+            p.line_segment([c + vec2(-s, s * 0.6), c + vec2(s, -s * 0.6)], st);
+            p.line_segment([c + vec2(s, s * 0.6), c + vec2(s * 0.5, s * 0.6)], st);
+            p.line_segment([c + vec2(s, -s * 0.6), c + vec2(s * 0.5, -s * 0.6)], st);
+        }
+        _ => {
+            // loop arrow (5) or loop with a dot for "repeat one" (6)
+            let rr = Rect::from_center_size(c, vec2(s * 2.0, s * 1.3));
+            p.rect_stroke(rr, s * 0.5, st);
+            p.add(Shape::convex_polygon(
+                vec![rr.right_top() + vec2(-s * 0.6, -s * 0.35), rr.right_top() + vec2(-s * 0.1, 0.0), rr.right_top() + vec2(-s * 0.6, s * 0.35)],
+                col,
+                Stroke::NONE,
+            ));
+            if which == 6 {
+                p.circle_filled(c, s * 0.28, col);
+            }
+        }
+    }
+}
+
+impl ShellApp {
+    fn media_art(&mut self, ctx: &egui::Context, track: &media::Track) -> Option<egui::TextureId> {
+        let art = track.art.as_ref()?;
+        if self.media_tex.as_ref().map(|(g, _)| *g) != Some(track.art_gen) {
+            let (w, h, px) = (&art.0, &art.1, &art.2);
+            let tex = ctx.load_texture(
+                format!("media-art-{}", track.art_gen),
+                egui::ColorImage::from_rgba_unmultiplied([*w, *h], px),
+                egui::TextureOptions::LINEAR,
+            );
+            self.media_tex = Some((track.art_gen, tex));
+        }
+        self.media_tex.as_ref().map(|(_, t)| t.id())
+    }
+
+    /// The panel element: cover, title / artist, time left, controls, progress.
+    fn media_widget(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        r: Rect,
+        track: &media::Track,
+        pal: &Palette,
+        actions: &mut Vec<PanelAction>,
+    ) {
+        let bw = 30.0;
+        let buttons = Rect::from_min_max(pos2(r.right() - 3.0 * bw, r.top()), r.max);
+        let info = Rect::from_min_max(r.min, pos2(buttons.left() - 4.0, r.bottom()));
+        let resp = ui.interact(info, ui.id().with("media-info"), Sense::click());
+        let p = ui.painter();
+        if self.media_open {
+            p.rect_filled(info, 4.0, pal.select);
+        } else if resp.hovered() {
+            p.rect_filled(info, 4.0, pal.hover);
+        }
+        let art_r = Rect::from_min_size(pos2(info.left() + 3.0, info.center().y - 15.0), vec2(30.0, 30.0));
+        match self.media_art(ctx, track) {
+            Some(t) => {
+                ui.painter().image(t, art_r, uv_full(), Color32::WHITE);
+            }
+            None => {
+                ui.painter().rect_filled(art_r, 4.0, pal.header);
+                paint_media_glyph(ui.painter(), art_r.shrink(6.0), 1, pal.dim);
+            }
+        }
+        let left = track.duration - track.position_now();
+        let time = if track.duration > 0.0 { format!("-{}", media::fmt_time(left)) } else { String::new() };
+        let p = ui.painter();
+        let time_w = if time.is_empty() { 0.0 } else { 44.0 };
+        let text = Rect::from_min_max(pos2(art_r.right() + 8.0, info.top()), pos2(info.right() - time_w - 4.0, info.bottom()));
+        let clip = p.with_clip_rect(text);
+        clip.text(pos2(text.left(), info.center().y - 7.0), Align2::LEFT_CENTER, &track.title, FontId::proportional(13.0), pal.text);
+        clip.text(pos2(text.left(), info.center().y + 9.0), Align2::LEFT_CENTER, &track.artist, FontId::proportional(11.5), pal.dim);
+        if !time.is_empty() {
+            p.text(pos2(info.right() - 4.0, info.center().y), Align2::RIGHT_CENTER, time, FontId::proportional(12.0), pal.dim);
+        }
+        // Progress along the bottom edge.
+        if track.duration > 0.0 {
+            let f = (track.position_now() / track.duration).clamp(0.0, 1.0) as f32;
+            let bar = Rect::from_min_max(pos2(r.left() + 2.0, r.bottom() + 1.0), pos2(r.right() - 2.0, r.bottom() + 3.0));
+            p.rect_filled(bar, 1.0, pal.border);
+            p.rect_filled(Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * f, bar.bottom())), 1.0, pal.accent);
+        }
+        for (k, (glyph, cmd)) in [(0u8, 0u8), (if track.playing { 2 } else { 1 }, 1), (3, 2)].into_iter().enumerate() {
+            let b = Rect::from_min_size(pos2(buttons.left() + k as f32 * bw, r.top() + 3.0), vec2(bw, r.height() - 6.0));
+            let br = ui.interact(b, ui.id().with(("media-btn", k)), Sense::click());
+            if br.hovered() {
+                ui.painter().rect_filled(b, 4.0, pal.hover);
+            }
+            paint_media_glyph(ui.painter(), Rect::from_center_size(b.center(), vec2(18.0, 18.0)), glyph, pal.text);
+            if br.clicked() {
+                actions.push(PanelAction::Media(match cmd {
+                    0 => media::Cmd::Prev,
+                    1 => media::Cmd::TogglePlay,
+                    _ => media::Cmd::Next,
+                }));
+            }
+        }
+        if resp.clicked() {
+            actions.push(PanelAction::ToggleMedia);
+        }
+        if resp.hovered() {
+            // keep the time ticking while the pointer rests on it
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// The player flyout above the panel element.
+    fn media_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(track) = self.media.current() else {
+            self.media_open = false;
+            return;
+        };
+        let screen = Self::screen_points(ctx);
+        let x = self.media_x.clamp(4.0, (screen.x - MEDIA_W - 4.0).max(4.0));
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Media")
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([MEDIA_W, MEDIA_H])
+            .with_position([x, screen.y - self.lift - PANEL_H - MEDIA_H - 8.0]);
+
+        let mut close = false;
+        let mut cmds: Vec<media::Cmd> = Vec::new();
+        let art = self.media_art(ctx, &track);
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_media"), builder, |ctx, _| {
+            if !win::reveal_popup("Delfin Media", true) {
+                ctx.request_repaint();
+            }
+            let focused = ctx.input(|i| i.viewport().focused);
+            if focused == Some(true) {
+                self.media_seen_focus = true;
+            }
+            if self.media_seen_focus && focused == Some(false) {
+                close = true;
+            }
+            if !self.media_seen_focus {
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested()) {
+                close = true;
+            }
+            if track.playing {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window).stroke(Stroke::new(1.0_f32, pal.border)).inner_margin(Margin::same(18.0)))
+                .show(ctx, |ui| {
+                    let full = ui.max_rect();
+                    let p = ui.painter().clone();
+                    // Header: app.
+                    let hdr = Rect::from_min_size(full.min, vec2(full.width(), 28.0));
+                    let dot = Rect::from_center_size(pos2(hdr.left() + 12.0, hdr.center().y), vec2(24.0, 24.0));
+                    p.circle_filled(dot.center(), 12.0, pal.accent);
+                    paint_media_glyph(&p, dot.shrink(5.0), 1, Color32::WHITE);
+                    p.text(pos2(dot.right() + 10.0, hdr.center().y), Align2::LEFT_CENTER, &track.app, FontId::proportional(15.0), pal.text);
+                    p.line_segment([pos2(full.left(), hdr.bottom() + 10.0), pos2(full.right(), hdr.bottom() + 10.0)], Stroke::new(1.0_f32, pal.border));
+
+                    // Cover and titles.
+                    let top = hdr.bottom() + 22.0;
+                    let art_r = Rect::from_min_size(pos2(full.left(), top), vec2(140.0, 140.0));
+                    match art {
+                        Some(t) => {
+                            p.image(t, art_r, uv_full(), Color32::WHITE);
+                        }
+                        None => {
+                            p.rect_filled(art_r, 8.0, pal.header);
+                            paint_media_glyph(&p, art_r.shrink(45.0), 1, pal.dim);
+                        }
+                    }
+                    let tx = art_r.right() + 18.0;
+                    let text = Rect::from_min_max(pos2(tx, top), pos2(full.right(), art_r.bottom()));
+                    let clip = p.with_clip_rect(text);
+                    clip.text(pos2(tx, top + 22.0), Align2::LEFT_CENTER, &track.title, FontId::proportional(20.0), pal.text);
+                    clip.text(pos2(tx, top + 50.0), Align2::LEFT_CENTER, &track.artist, FontId::proportional(15.0), pal.dim);
+                    if !track.album.is_empty() && track.album != track.title {
+                        clip.text(pos2(tx, top + 72.0), Align2::LEFT_CENTER, &track.album, FontId::proportional(12.5), pal.dim);
+                    }
+
+                    // Progress: click / drag to seek.
+                    if track.duration > 0.0 {
+                        let now = track.position_now();
+                        let y = art_r.bottom() - 12.0;
+                        p.text(pos2(tx, y), Align2::LEFT_CENTER, media::fmt_time(now), FontId::proportional(12.5), pal.text);
+                        p.text(pos2(full.right(), y), Align2::RIGHT_CENTER, format!("-{}", media::fmt_time(track.duration - now)), FontId::proportional(12.5), pal.text);
+                        let bar = Rect::from_min_max(pos2(tx + 44.0, y - 2.0), pos2(full.right() - 48.0, y + 2.0));
+                        let hit = bar.expand2(vec2(0.0, 8.0));
+                        let resp = ui.interact(hit, ui.id().with("seek"), Sense::click_and_drag());
+                        let f = (now / track.duration).clamp(0.0, 1.0) as f32;
+                        p.rect_filled(bar, 2.0, pal.border);
+                        p.rect_filled(Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * f, bar.bottom())), 2.0, pal.accent);
+                        if resp.hovered() || resp.dragged() {
+                            p.circle_filled(pos2(bar.left() + bar.width() * f, bar.center().y), 6.0, pal.accent);
+                        }
+                        if track.can_seek && (resp.clicked() || resp.drag_stopped()) {
+                            if let Some(pt) = resp.interact_pointer_pos() {
+                                let to = ((pt.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64 * track.duration;
+                                cmds.push(media::Cmd::Seek(to));
+                            }
+                        }
+                    }
+
+                    // Controls.
+                    let row_y = art_r.bottom() + 42.0;
+                    let mid = full.center().x;
+                    let buttons: [(f32, u8, f32); 5] = [
+                        (-150.0, 4, 34.0),
+                        (-78.0, 0, 38.0),
+                        (0.0, if track.playing { 2 } else { 1 }, 58.0),
+                        (78.0, 3, 38.0),
+                        (150.0, if track.repeat == media::Repeat::Track { 6 } else { 5 }, 34.0),
+                    ];
+                    for (k, (dx, glyph, size)) in buttons.into_iter().enumerate() {
+                        let b = Rect::from_center_size(pos2(mid + dx, row_y), vec2(size, size));
+                        let enabled = match k {
+                            0 => track.can_shuffle,
+                            4 => track.can_repeat,
+                            _ => true,
+                        };
+                        let resp = ui.interact(b, ui.id().with(("ctl", k)), if enabled { Sense::click() } else { Sense::hover() });
+                        let active = (k == 0 && track.shuffle) || (k == 4 && track.repeat != media::Repeat::Off);
+                        let col = if !enabled {
+                            pal.border
+                        } else if active {
+                            pal.accent
+                        } else {
+                            pal.text
+                        };
+                        if k == 2 {
+                            p.circle_stroke(b.center(), size / 2.0, Stroke::new(1.6_f32, if resp.hovered() { pal.accent } else { pal.dim }));
+                        } else if resp.hovered() && enabled {
+                            p.circle_filled(b.center(), size / 2.0, pal.hover);
+                        }
+                        let g = if k == 2 { 26.0 } else { 20.0 };
+                        paint_media_glyph(&p, Rect::from_center_size(b.center(), vec2(g, g)), glyph, col);
+                        if resp.clicked() {
+                            cmds.push(match k {
+                                0 => media::Cmd::Shuffle(!track.shuffle),
+                                1 => media::Cmd::Prev,
+                                2 => media::Cmd::TogglePlay,
+                                3 => media::Cmd::Next,
+                                _ => media::Cmd::Repeat(match track.repeat {
+                                    media::Repeat::Off => media::Repeat::List,
+                                    media::Repeat::List => media::Repeat::Track,
+                                    media::Repeat::Track => media::Repeat::Off,
+                                }),
+                            });
+                        }
+                    }
+
+                    // Volume (whole system).
+                    let vol_y = row_y + 52.0;
+                    if let Some((level, muted)) = self.qp.volume_state() {
+                        let sp = Rect::from_center_size(pos2(full.left() + 12.0, vol_y), vec2(24.0, 24.0));
+                        let sresp = ui.interact(sp, ui.id().with("mute"), Sense::click());
+                        quick::paint_speaker(&p, sp, pal.text, if muted { None } else { Some(level) });
+                        if sresp.clicked() {
+                            self.qp.toggle_mute();
+                        }
+                        let mut v = (level * 100.0).round();
+                        let slider = Rect::from_min_max(pos2(sp.right() + 12.0, vol_y - 10.0), pos2(full.right() - 40.0, vol_y + 10.0));
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(slider));
+                        child.spacing_mut().slider_width = slider.width();
+                        if child.add(egui::Slider::new(&mut v, 0.0..=100.0).show_value(false)).changed() {
+                            self.qp.set_volume(v / 100.0);
+                        }
+                        p.text(pos2(full.right(), vol_y), Align2::RIGHT_CENTER, format!("{v:.0}%"), FontId::proportional(12.5), pal.dim);
+                    }
+                });
+        });
+        for c in cmds {
+            self.media.send(c);
+        }
+        if close {
+            self.media_open = false;
+            self.media_closed_at = Instant::now();
         }
     }
 }

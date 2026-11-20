@@ -587,6 +587,22 @@ impl QuickPanel {
         s.networks.iter().find(|n| n.connected).map(|n| n.signal)
     }
 
+    pub fn toggle_mute(&self) {
+        if let Some(v) = &self.vol {
+            v.set_muted(!v.muted());
+        }
+    }
+
+    /// 0.0 ..= 1.0; also unmutes.
+    pub fn set_volume(&self, level: f32) {
+        if let Some(v) = &self.vol {
+            v.set_level(level);
+            if v.muted() {
+                v.set_muted(false);
+            }
+        }
+    }
+
     /// Change the volume by `delta` (0..1 scale), e.g. from the mouse wheel.
     pub fn nudge_volume(&self, delta: f32) {
         if let Some(v) = &self.vol {
