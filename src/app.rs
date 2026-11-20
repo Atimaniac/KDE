@@ -1420,7 +1420,7 @@ impl App {
                             display_name(&p.cwd)
                         }
                         1 => {
-                            icons::paint_entry_icon(painter, rect, sel[0].is_dir, &sel[0].ext, pal);
+                            crate::fileicons::paint(painter, rect, &sel[0].path, sel[0].is_dir, &sel[0].ext, pal);
                             sel[0].name.clone()
                         }
                         n => {
@@ -2228,7 +2228,7 @@ fn grid_view(
                                 pos2(rect.left() + 4.0, rect.center().y - isz / 2.0),
                                 vec2(isz, isz),
                             );
-                            icons::paint_entry_icon(p, ir, e.is_dir, &e.ext, pal);
+                            crate::fileicons::paint(p, ir, &e.path, e.is_dir, &e.ext, pal);
                             if dim {
                                 dim_rect(p, ir, pal);
                             }
@@ -2247,7 +2247,7 @@ fn grid_view(
                                 pos2(rect.center().x, rect.top() + 6.0 + isz / 2.0),
                                 vec2(isz, isz),
                             );
-                            icons::paint_entry_icon(p, ir, e.is_dir, &e.ext, pal);
+                            crate::fileicons::paint(p, ir, &e.path, e.is_dir, &e.ext, pal);
                             if dim {
                                 dim_rect(p, ir, pal);
                             }
@@ -2379,7 +2379,7 @@ fn details_view(
                 let cy = rect.center().y;
                 let font = FontId::proportional(13.0);
                 let ir = Rect::from_center_size(pos2(rect.left() + 14.0, cy), vec2(18.0, 18.0));
-                icons::paint_entry_icon(p, ir, e.is_dir, &e.ext, pal);
+                crate::fileicons::paint(p, ir, &e.path, e.is_dir, &e.ext, pal);
                 if e.hidden || cut.contains(&e.path) {
                     dim_rect(p, ir, pal);
                 }

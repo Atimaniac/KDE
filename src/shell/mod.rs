@@ -1131,7 +1131,7 @@ impl ShellApp {
                         // Volume and network: two separate buttons, each with its own
                         // flyout (layout is right-to-left, so volume is drawn first).
                         for section in [quick::Section::Sound, quick::Section::Network] {
-                            let (r, resp) = ui.allocate_exact_size(vec2(30.0, 36.0), Sense::click());
+                            let (r, resp) = ui.allocate_exact_size(vec2(28.0, 36.0), Sense::click());
                             let p = ui.painter();
                             if self.quick_open == Some(section) {
                                 p.rect_filled(r, 4.0, pal.select);
@@ -1144,7 +1144,8 @@ impl ShellApp {
                                         .vol_state
                                         .map(|(l, m)| if m { None } else { Some(l) })
                                         .unwrap_or(Some(1.0));
-                                    quick::paint_speaker(p, r, pal.text, level);
+                                    // Same visual size as the 18 px tray icons next to it.
+                                    quick::paint_speaker(p, Rect::from_center_size(r.center(), vec2(24.0, 24.0)), pal.text, level);
                                     // Mouse wheel over the speaker changes the volume.
                                     if resp.hovered() {
                                         let wheel = ui.input(|i| i.raw_scroll_delta.y);
@@ -1159,7 +1160,7 @@ impl ShellApp {
                                     }
                                 }
                                 quick::Section::Network => {
-                                    quick::paint_network(p, r, pal, self.wifi_sig, self.wired);
+                                    quick::paint_network(p, Rect::from_center_size(r.center(), vec2(22.0, 22.0)), pal, self.wifi_sig, self.wired);
                                     match self.qp.connected_ssid() {
                                         Some(ssid) => crate::i18n::trf("Wi-Fi: {}", &[&ssid]),
                                         None if self.wired => crate::i18n::tr("Ethernet: connected").to_string(),

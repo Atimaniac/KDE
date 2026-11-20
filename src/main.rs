@@ -7,6 +7,7 @@ mod config;
 mod display;
 mod fsops;
 mod i18n;
+mod fileicons;
 mod icons;
 mod platform;
 #[cfg(windows)]
