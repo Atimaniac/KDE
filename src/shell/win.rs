@@ -232,6 +232,73 @@ pub fn set_shell_window(h: isize) {
 // ----------------------------------------------------------------- screen
 
 /// Primary monitor size in physical pixels.
+/// Does this window cover the whole primary screen without a title bar
+/// (a game, a full-screen video, a slideshow)? The desktop doesn't count.
+pub fn is_fullscreen(h: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowRect};
+    if h == 0 {
+        return false;
+    }
+    let hw = h as HWND;
+    unsafe {
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(hw, cls.as_mut_ptr(), cls.len() as i32);
+        let cls = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+        if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            return false;
+        }
+        let style = GetWindowLongPtrW(hw, -16 /* GWL_STYLE */) as u32;
+        if style & 0x00C0_0000 == 0x00C0_0000 {
+            return false; // WS_CAPTION: an ordinary maximised window
+        }
+        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        GetWindowRect(hw, &mut r);
+        let (w, h) = screen_px();
+        r.left <= 0 && r.top <= 0 && r.right >= w && r.bottom >= h
+    }
+}
+
+/// Let a full-screen window cover the panel: drop "always on top" and go just
+/// below it.
+pub fn panel_below(panel: isize, fullscreen: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos;
+    const FLAGS: u32 = 0x0001 | 0x0002 | 0x0010; // NOSIZE | NOMOVE | NOACTIVATE
+    unsafe {
+        SetWindowPos(panel as HWND, -2isize as HWND /* HWND_NOTOPMOST */, 0, 0, 0, 0, FLAGS);
+        SetWindowPos(panel as HWND, fullscreen as HWND, 0, 0, 0, 0, FLAGS);
+    }
+}
+
+pub fn panel_on_top(panel: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos;
+    unsafe {
+        SetWindowPos(panel as HWND, -1isize as HWND /* HWND_TOPMOST */, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+    }
+}
+
+/// Without Explorer, Windows parks minimised windows as little title bars in
+/// the bottom-left corner. Hide them instead, like Explorer does (this sign-in
+/// only; nothing is saved).
+pub fn hide_minimized_windows() {
+    #[repr(C)]
+    struct MinimizedMetrics {
+        cb_size: u32,
+        width: i32,
+        horz_gap: i32,
+        vert_gap: i32,
+        arrange: i32,
+    }
+    let mut mm = MinimizedMetrics { cb_size: 20, width: 0, horz_gap: 0, vert_gap: 0, arrange: 0 };
+    unsafe {
+        let p = &mut mm as *mut MinimizedMetrics as *mut c_void;
+        SystemParametersInfoW(0x002B /* SPI_GETMINIMIZEDMETRICS */, 20, p, 0);
+        if mm.arrange & 8 == 0 {
+            mm.arrange |= 8; // ARW_HIDE
+            SystemParametersInfoW(0x002C /* SPI_SETMINIMIZEDMETRICS */, 20, p, 0);
+        }
+    }
+}
+
 pub fn screen_px() -> (i32, i32) {
     unsafe {
         (

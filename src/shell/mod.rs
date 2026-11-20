@@ -117,6 +117,8 @@ struct ShellApp {
     icon_of: HashMap<isize, isize>,
     last_poll: Instant,
     last_fg: isize,
+    /// A full-screen program is in front: the panel stays below it.
+    fullscreen: bool,
     hidden_for_desktop: Vec<isize>,
     // launcher
     apps: Vec<AppEntry>,
@@ -213,6 +215,7 @@ impl ShellApp {
         // there is no taskbar and don't create their icons. Skip it if
         // Explorer's tray is running (test mode with explorer.exe alive).
         let tray = if win::find_class("Shell_TrayWnd").is_none() {
+            win::hide_minimized_windows();
             Some(tray::start(cc.egui_ctx.clone()))
         } else {
             None
@@ -246,6 +249,7 @@ impl ShellApp {
             icon_of: HashMap::new(),
             last_poll: long_ago,
             last_fg: 0,
+            fullscreen: false,
             hidden_for_desktop: Vec::new(),
             apps,
             launcher_open: false,
@@ -366,19 +370,32 @@ impl ShellApp {
     }
 
     /// Screen position (physical px) that programs expect as the click anchor.
-    fn anchor_px(ctx: &egui::Context, x_points: f32) -> (i32, i32) {
+    fn anchor_px(&self, ctx: &egui::Context, x_points: f32) -> (i32, i32) {
         let ppp = ctx.pixels_per_point();
         let (_, h_px) = win::screen_px();
         (
             (x_points * ppp) as i32,
-            h_px - (PANEL_H * ppp).round() as i32,
+            h_px - ((self.lift + PANEL_H) * ppp).round() as i32,
         )
+    }
+
+    /// Screen rectangle (pixels) of something drawn on the panel.
+    fn panel_rect_px(&self, ctx: &egui::Context, r: Rect) -> [i32; 4] {
+        let ppp = ctx.pixels_per_point();
+        let (_, h_px) = win::screen_px();
+        let top = h_px as f32 - (self.lift + PANEL_H) * ppp;
+        [
+            (r.left() * ppp) as i32,
+            (top + r.top() * ppp) as i32,
+            (r.right() * ppp) as i32,
+            (top + r.bottom() * ppp) as i32,
+        ]
     }
 
     fn send_tray_click(&mut self, ctx: &egui::Context, hwnd: isize, uid: u32, kind: Click, x: f32) {
         let icons = self.tray_icons();
         if let Some(ic) = icons.iter().find(|i| i.hwnd == hwnd && i.uid == uid) {
-            tray::click(ic, kind, Self::anchor_px(ctx, x));
+            tray::click(ic, kind, self.anchor_px(ctx, x));
         }
     }
 
@@ -500,6 +517,7 @@ impl ShellApp {
         self.tray_checked = Instant::now();
         if win::find_class("Shell_TrayWnd").is_none() {
             self.tray = Some(tray::start(ctx.clone()));
+            win::hide_minimized_windows();
         }
     }
 
@@ -885,6 +903,18 @@ impl ShellApp {
             return;
         }
         self.last_poll = Instant::now();
+        // Games and full-screen videos cover the panel, like Explorer's taskbar.
+        let full = fg != 0 && win::pid_of(fg) != self.own_pid && win::is_fullscreen(fg);
+        if full != self.fullscreen {
+            self.fullscreen = full;
+            if let Some(panel) = win::find_window(PANEL_TITLE) {
+                if full {
+                    win::panel_below(panel, fg);
+                } else {
+                    win::panel_on_top(panel);
+                }
+            }
+        }
         let fresh = win::task_windows(self.own_pid);
         // Keep the existing order; new windows go to the end.
         let mut merged: Vec<win::TaskWindow> = Vec::new();
@@ -1090,6 +1120,7 @@ impl ShellApp {
                         for ic in icons_now[..inline_n].iter().rev() {
                             let tex = self.tray_texture(ctx, ic);
                             let r = Self::tray_slot(ui, tex.as_ref(), false, pal);
+                            tray::set_icon_rect(ic.hwnd, ic.uid, self.panel_rect_px(ctx, r.rect));
                             let x = r.rect.center().x;
                             let id = (ic.hwnd, ic.uid);
                             if r.hovered() {

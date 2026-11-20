@@ -241,12 +241,74 @@ unsafe fn handle_notify(cds: &CopyData) -> bool {
     ok
 }
 
+/// Screen rectangles of the icons as last drawn on the panel, in pixels.
+static ICON_RECTS: Mutex<Vec<((isize, u32), [i32; 4])>> = Mutex::new(Vec::new());
+
+/// Called by the panel while drawing: where an icon is on screen (pixels).
+pub fn set_icon_rect(hwnd: isize, uid: u32, rect: [i32; 4]) {
+    let mut v = ICON_RECTS.lock().unwrap_or_else(|p| p.into_inner());
+    match v.iter_mut().find(|(k, _)| *k == (hwnd, uid)) {
+        Some(e) => e.1 = rect,
+        None => v.push(((hwnd, uid), rect)),
+    }
+}
+
+/// Shell_NotifyIconGetRect: a program asks where its icon is. Many programs
+/// (everything built on the `tray-icon` crate, Electron apps, …) do this on
+/// every click and ignore the click if the answer is "nowhere".
+///
+/// The request is NOTIFYICONIDENTIFIER with a 32-bit header:
+/// { magic, message (1 = top-left, 2 = bottom-right), cbSize, hWnd, uID, guid }
+/// and the answer is the point packed as MAKELONG(x, y).
+unsafe fn icon_rect_query(cds: &CopyData) -> LRESULT {
+    let mut buf = [0u8; 36];
+    let n = (cds.cb_data as usize).min(buf.len());
+    std::ptr::copy_nonoverlapping(cds.lp_data as *const u8, buf.as_mut_ptr(), n);
+    let u = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+    if u(0) != 0x3475_3423 {
+        return 0;
+    }
+    let (which, hwnd, uid) = (u(4), handle(u(12)), u(16));
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&buf[20..36]);
+
+    // Is it one of our icons? (Match by GUID when the program uses one.)
+    let known = STATE.get().is_some_and(|s| {
+        let st = s.lock().unwrap_or_else(|p| p.into_inner());
+        st.icons.iter().any(|i| (i.hwnd == hwnd && i.uid == uid) || i.guid == Some(guid))
+    });
+    if !known {
+        return 0;
+    }
+    let rect = ICON_RECTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(k, _)| *k == (hwnd, uid))
+        .map(|(_, r)| *r)
+        .unwrap_or_else(|| {
+            // Not drawn yet (e.g. behind the ^ overflow): use the mouse position.
+            let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+            [pt.x - 12, pt.y - 12, pt.x + 12, pt.y + 12]
+        });
+    let pack = |x: i32, y: i32| ((x as u16 as u32) | ((y as u16 as u32) << 16)) as i32 as LRESULT;
+    match which {
+        1 => pack(rect[0], rect[1]),
+        2 => pack(rect[2], rect[3]),
+        _ => 0,
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == 0x004A {
         // WM_COPYDATA: 0 = app bar, 1 = notify icon, 3 = icon position query
         let cds = &*(lparam as *const CopyData);
         if cds.dw_data == 1 && !cds.lp_data.is_null() && cds.cb_data >= 32 {
             return handle_notify(cds) as LRESULT;
+        }
+        if cds.dw_data == 3 && !cds.lp_data.is_null() && cds.cb_data >= 20 {
+            return icon_rect_query(cds);
         }
         return 0;
     }
