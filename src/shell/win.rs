@@ -290,12 +290,26 @@ pub fn hide_minimized_windows() {
     }
     let mut mm = MinimizedMetrics { cb_size: 20, width: 0, horz_gap: 0, vert_gap: 0, arrange: 0 };
     unsafe {
-        let p = &mut mm as *mut MinimizedMetrics as *mut c_void;
-        SystemParametersInfoW(0x002B /* SPI_GETMINIMIZEDMETRICS */, 20, p, 0);
+        SystemParametersInfoW(0x002B /* SPI_GETMINIMIZEDMETRICS */, 20, &mut mm as *mut MinimizedMetrics as *mut c_void, 0);
         if mm.arrange & 8 == 0 {
             mm.arrange |= 8; // ARW_HIDE
-            SystemParametersInfoW(0x002C /* SPI_SETMINIMIZEDMETRICS */, 20, p, 0);
+            SystemParametersInfoW(0x002C /* SPI_SETMINIMIZEDMETRICS */, 20, &mut mm as *mut MinimizedMetrics as *mut c_void, 0);
         }
+    }
+}
+
+/// Move windows that were already minimised (and parked as title bars above
+/// the panel) off the screen, where Explorer keeps them.
+pub fn hide_parked_minimized() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos;
+    unsafe extern "system" fn cb(h: HWND, _: LPARAM) -> BOOL {
+        if IsWindowVisible(h) != 0 && IsIconic(h) != 0 {
+            SetWindowPos(h, null_mut(), -32000, -32000, 0, 0, 0x0001 | 0x0004 | 0x0010); // NOSIZE | NOZORDER | NOACTIVATE
+        }
+        1
+    }
+    unsafe {
+        EnumWindows(Some(cb), 0);
     }
 }
 

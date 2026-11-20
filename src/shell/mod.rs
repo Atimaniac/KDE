@@ -658,6 +658,7 @@ impl ShellApp {
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title(tr("Delfin Settings"))
+            .with_icon(theme::app_icon())
             .with_resizable(false)
             .with_inner_size([W, H])
             .with_position([(screen.x - W) / 2.0, (screen.y - H) / 2.0]);

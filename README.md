@@ -45,11 +45,21 @@ target\release\delfin.exe --shell
 To get Explorer back: Delfin settings → *Back to Explorer*, or Ctrl+Alt+Del → Task Manager →
 *Run new task* → `explorer.exe`.
 
-### Install as your shell
+### Install
 
-Delfin menu (☰) → *System* → **Use Delfin as Windows shell…**, or `delfin.exe --install-shell`.
-Then sign out and back in. It's per user (HKCU, no admin). The exe is copied to
-`%LOCALAPPDATA%\Programs\Delfin\delfin.exe`.
+Download **`delfin-setup.exe`** from [Releases](https://github.com/Atimaniac/kde/releases) and run it
+(or run `delfin.exe --setup`). The installer:
+
+- copies Delfin to `%LOCALAPPDATA%\Programs\Delfin\delfin.exe` (per user, no admin rights),
+- makes Delfin the Windows shell **and** the file manager: panel, launcher, desktop and tray at
+  sign-in, and folders opened anywhere in Windows open in Delfin (both can be switched off),
+- adds a Start menu shortcut (and a desktop one if you want), and an entry in Settings › Apps
+  that uninstalls it again (`delfin.exe --uninstall`),
+- at the end, switches from Explorer to Delfin right away, or at your next sign-in.
+
+Running the installer again over an existing installation updates it, even while Delfin runs.
+Without the installer: Delfin menu (☰) → *System* → **Use Delfin as Windows shell…**, or
+`delfin.exe --install-shell`, then sign out and back in.
 
 **Go back:** Delfin settings → *Back to Explorer* (click twice), or `delfin.exe --uninstall-shell`.
 Emergency (black screen): Ctrl+Alt+Del → Task Manager → *Run new task* → `explorer.exe`,

@@ -258,28 +258,39 @@ pub fn set_icon_rect(hwnd: isize, uid: u32, rect: [i32; 4]) {
 /// every click and ignore the click if the answer is "nowhere".
 ///
 /// The request is NOTIFYICONIDENTIFIER with a 32-bit header:
-/// { magic, message (1 = top-left, 2 = bottom-right), cbSize, hWnd, uID, guid }
+/// { magic, message (1 = top-left, 2 = width and height), cbSize, 0, hWnd, uID, guid }
 /// and the answer is the point packed as MAKELONG(x, y).
 unsafe fn icon_rect_query(cds: &CopyData) -> LRESULT {
-    let mut buf = [0u8; 36];
+    let mut buf = [0u8; 48];
     let n = (cds.cb_data as usize).min(buf.len());
     std::ptr::copy_nonoverlapping(cds.lp_data as *const u8, buf.as_mut_ptr(), n);
     let u = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
     if u(0) != 0x3475_3423 {
         return 0;
     }
-    let (which, hwnd, uid) = (u(4), handle(u(12)), u(16));
-    let mut guid = [0u8; 16];
-    guid.copy_from_slice(&buf[20..36]);
+    let which = u(4);
+    let guid_at = |o: usize| {
+        let mut g = [0u8; 16];
+        g.copy_from_slice(&buf[o..o + 16]);
+        g
+    };
+    // As seen on Windows 11: { magic, message, cbSize (32), 0, hWnd, uID, guid }.
+    // The second layout (no zero field) is what some documentation shows.
+    let layouts = [(handle(u(16)), u(20), guid_at(24)), (handle(u(12)), u(16), guid_at(20))];
 
     // Is it one of our icons? (Match by GUID when the program uses one.)
-    let known = STATE.get().is_some_and(|s| {
+    let found = STATE.get().and_then(|s| {
         let st = s.lock().unwrap_or_else(|p| p.into_inner());
-        st.icons.iter().any(|i| (i.hwnd == hwnd && i.uid == uid) || i.guid == Some(guid))
+        layouts.iter().find_map(|&(hwnd, uid, guid)| {
+            st.icons
+                .iter()
+                .find(|i| (hwnd != 0 && i.hwnd == hwnd && i.uid == uid) || (guid != [0; 16] && i.guid == Some(guid)))
+                .map(|i| (i.hwnd, i.uid))
+        })
     });
-    if !known {
+    let Some((hwnd, uid)) = found else {
         return 0;
-    }
+    };
     let rect = ICON_RECTS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -295,7 +306,7 @@ unsafe fn icon_rect_query(cds: &CopyData) -> LRESULT {
     let pack = |x: i32, y: i32| ((x as u16 as u32) | ((y as u16 as u32) << 16)) as i32 as LRESULT;
     match which {
         1 => pack(rect[0], rect[1]),
-        2 => pack(rect[2], rect[3]),
+        2 => pack(rect[2] - rect[0], rect[3] - rect[1]), // Windows adds this to the top-left
         _ => 0,
     }
 }
@@ -313,6 +324,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         return 0;
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn RegisterShellHookWindow(hwnd: HWND) -> i32;
+}
+
+/// SetTaskmanWindow is exported by user32 but missing from the SDK import
+/// library, so look it up at run time. Explorer calls it at start-up.
+unsafe fn set_taskman_window(hwnd: HWND) {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    let user32 = GetModuleHandleW(wide("user32.dll").as_ptr());
+    if user32.is_null() {
+        return;
+    }
+    if let Some(f) = GetProcAddress(user32, b"SetTaskmanWindow\0".as_ptr()) {
+        let f: unsafe extern "system" fn(HWND) -> i32 = std::mem::transmute(f);
+        f(hwnd);
+    }
 }
 
 /// Create the hidden `Shell_TrayWnd` window on its own thread.
@@ -353,6 +383,12 @@ pub fn start(ctx: egui::Context) -> Shared {
             null(),
         );
         // Let sandboxed / low-integrity programs reach us.
+        // Like Explorer: register as the "task manager" window. Only then does
+        // Windows honour ARW_HIDE and keep minimised windows off-screen instead
+        // of parking them as little title bars above the panel.
+        set_taskman_window(hwnd);
+        RegisterShellHookWindow(hwnd);
+        crate::shell::win::hide_parked_minimized();
         let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         ChangeWindowMessageFilterEx(hwnd, 0x004A, 1, null_mut());
         ChangeWindowMessageFilterEx(hwnd, taskbar_created, 1, null_mut());

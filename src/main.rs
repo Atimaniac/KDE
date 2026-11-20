@@ -8,6 +8,8 @@ mod i18n;
 mod icons;
 mod platform;
 #[cfg(windows)]
+mod setup;
+#[cfg(windows)]
 mod shell;
 mod theme;
 #[cfg(windows)]
@@ -22,6 +24,21 @@ fn main() -> Result<(), eframe::Error> {
     update::cleanup_old();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
+
+    // Installer (`delfin-setup.exe` or `--setup`) and uninstaller (`--uninstall`,
+    // what Windows Settings › Apps runs).
+    #[cfg(windows)]
+    {
+        if has("--uninstall") {
+            return setup::run_uninstall();
+        }
+        if has("--silent") && (has("--setup") || setup::started_as_setup()) {
+            std::process::exit(setup::run_install_silent());
+        }
+        if has("--setup") || (setup::started_as_setup() && !has("--shell")) {
+            return setup::run_install();
+        }
+    }
 
     // Desktop shell mode (panel + launcher + desktop), replaces explorer.exe.
     if has("--shell") {
@@ -58,6 +75,7 @@ fn main() -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Delfin")
             .with_app_id("delfin")
+            .with_icon(theme::app_icon())
             .with_inner_size([1180.0, 740.0])
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()

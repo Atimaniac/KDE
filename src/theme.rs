@@ -163,3 +163,15 @@ pub fn install_fonts(ctx: &egui::Context) {
         }
     }
 }
+
+/// The Delfin logo as a window icon (title bar, Alt+Tab, taskbar).
+pub fn app_icon() -> std::sync::Arc<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("../assets/delfin.png"))
+        .map(|i| i.to_rgba8())
+        .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
+    std::sync::Arc::new(egui::IconData {
+        width: img.width(),
+        height: img.height(),
+        rgba: img.into_raw(),
+    })
+}
