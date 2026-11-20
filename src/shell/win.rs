@@ -879,3 +879,24 @@ pub fn round_corners(h: isize) {
     let pref: i32 = 2; // DWMWCP_ROUND
     unsafe { DwmSetWindowAttribute(h as HWND, 33, &pref as *const i32 as *const c_void, 4) };
 }
+
+/// A WM_APPCOMMAND that reached the shell (see the tray window): volume and
+/// media commands. Returns true when Delfin handled it.
+pub fn app_command(cmd: u16) -> bool {
+    use std::sync::atomic::Ordering;
+    if EXPLORER_PRESENT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let h = match cmd {
+        8 => Hotkey::Volume(0),                       // APPCOMMAND_VOLUME_MUTE
+        9 => Hotkey::Volume(-1),                      // APPCOMMAND_VOLUME_DOWN
+        10 => Hotkey::Volume(1),                      // APPCOMMAND_VOLUME_UP
+        11 => Hotkey::Media(MediaKey::Next),          // APPCOMMAND_MEDIA_NEXTTRACK
+        12 => Hotkey::Media(MediaKey::Prev),          // APPCOMMAND_MEDIA_PREVIOUSTRACK
+        13 => Hotkey::Media(MediaKey::Stop),          // APPCOMMAND_MEDIA_STOP
+        14 | 46 | 47 => Hotkey::Media(MediaKey::PlayPause), // PLAY_PAUSE, PLAY, PAUSE
+        _ => return false,
+    };
+    hook_send(h);
+    true
+}

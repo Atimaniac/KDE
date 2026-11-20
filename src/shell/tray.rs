@@ -312,6 +312,18 @@ unsafe fn icon_rect_query(cds: &CopyData) -> LRESULT {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Shell hook: keyboards whose volume / media keys send WM_APPCOMMAND
+    // (instead of a key) reach the shell this way once the focused window
+    // doesn't handle them. Explorer reacts to them; without it, Delfin does.
+    static SHELLHOOK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let shellhook = *SHELLHOOK.get_or_init(|| RegisterWindowMessageW(wide("SHELLHOOK").as_ptr()));
+    if msg == shellhook && wparam == 12 {
+        // HSHELL_APPCOMMAND: the command is in the high word of lParam.
+        let cmd = ((lparam as u32 >> 16) & 0x0FFF) as u16;
+        if super::win::app_command(cmd) {
+            return 1;
+        }
+    }
     if msg == 0x004A {
         // WM_COPYDATA: 0 = app bar, 1 = notify icon, 3 = icon position query
         let cds = &*(lparam as *const CopyData);
