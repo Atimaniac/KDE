@@ -15,6 +15,8 @@ mod setup;
 mod shell;
 mod theme;
 #[cfg(windows)]
+mod taskmgr;
+#[cfg(windows)]
 mod update;
 
 use eframe::egui;
@@ -31,6 +33,18 @@ fn main() -> Result<(), eframe::Error> {
     // what Windows Settings › Apps runs).
     #[cfg(windows)]
     {
+        // Task manager. When it replaces taskmgr.exe, Windows starts it as
+        // `delfin.exe --taskmgr <path of taskmgr.exe>`, so this comes first.
+        if has("--taskmgr") {
+            return taskmgr::run();
+        }
+        if let Some(i) = args.iter().position(|a| a == "--replace-taskmgr") {
+            let on = args.get(i + 1).map(|v| v != "off").unwrap_or(true);
+            if let Err(e) = taskmgr::replace(on) {
+                platform::message("Delfin", &e);
+            }
+            return Ok(());
+        }
         if has("--display") {
             return display::run();
         }

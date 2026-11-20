@@ -33,7 +33,15 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
   into the tray (blue underline); click it to bring it back.
 - **Startup apps** from the registry *Run* keys and Startup folders (disabled entries in Task
   Manager are respected).
-- **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher.
+- **Task Manager** (`delfin.exe --taskmgr`, Ctrl+Shift+Esc): processes grouped into apps and background
+  processes with CPU, memory, disk and GPU use (end task, efficiency mode, priority, open location),
+  performance graphs (CPU per core and speed, memory, disks, network, GPU with NVIDIA temperature),
+  start-up apps (enable / disable), details and services (start / stop). With *Replace Windows Task
+  Manager* (installer, Delfin settings or `delfin.exe --replace-taskmgr on|off`, needs administrator
+  rights once) every start of taskmgr.exe, also from Ctrl+Alt+Del, opens it; this uses the same
+  "Image File Execution Options" entry as Process Explorer's "Replace Task Manager".
+- **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher, `Alt+Tab` window
+  switcher, `Ctrl+Shift+Esc` task manager.
 - Folders opened anywhere in Windows open in Delfin.
 
 ### Try it without installing

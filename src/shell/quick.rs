@@ -934,3 +934,68 @@ fn paint_media(p: &egui::Painter, r: Rect, which: usize, col: Color32) {
         }
     }
 }
+
+/// Is a wired (Ethernet) adapter up and routed (it has a gateway)?
+pub fn wired_connected() -> bool {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH};
+    const GAA_FLAG_INCLUDE_GATEWAYS: u32 = 0x80;
+    const SKIP: u32 = 0x2 | 0x4 | 0x8; // no anycast, multicast, DNS servers
+    unsafe {
+        let mut size = 16 * 1024u32;
+        let mut buf: Vec<u64> = vec![0; size as usize / 8];
+        let mut r = GetAdaptersAddresses(0, GAA_FLAG_INCLUDE_GATEWAYS | SKIP, null(), buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH, &mut size);
+        if r == 111 {
+            // ERROR_BUFFER_OVERFLOW: retry with the size Windows asked for
+            buf = vec![0; size as usize / 8 + 1];
+            r = GetAdaptersAddresses(0, GAA_FLAG_INCLUDE_GATEWAYS | SKIP, null(), buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH, &mut size);
+        }
+        if r != 0 {
+            return false;
+        }
+        let mut a = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !a.is_null() {
+            let ad = &*a;
+            // 6 = Ethernet, OperStatus 1 = up
+            if ad.IfType == 6 && ad.OperStatus == 1 && !ad.FirstGatewayAddress.is_null() {
+                return true;
+            }
+            a = ad.Next;
+        }
+    }
+    false
+}
+
+/// Network icon: a monitor; with Wi-Fi a blue fan in the corner shows the
+/// signal (`wifi` = 0..=100); grey with a red cross when offline.
+pub fn paint_network(p: &egui::Painter, r: Rect, pal: &Palette, wifi: Option<u32>, wired: bool) {
+    let online = wired || wifi.is_some();
+    let col = if online { pal.text } else { pal.border };
+    let s = r.height() / 28.0; // drawn on a 28-unit grid
+    let at = |x: f32, y: f32| pos2(r.left() + (r.width() - 28.0 * s) / 2.0 + x * s, r.top() + y * s);
+    let st = Stroke::new(1.8 * s, col);
+    // Screen and stand.
+    p.rect_stroke(Rect::from_min_max(at(3.0, 4.0), at(23.0, 18.0)), 2.0 * s, st);
+    p.line_segment([at(13.0, 18.0), at(13.0, 22.0)], st);
+    p.line_segment([at(10.0, 22.0), at(16.0, 22.0)], st);
+    if !online {
+        let x = Stroke::new(2.2 * s, pal.danger);
+        p.line_segment([at(18.0, 18.0), at(26.0, 26.0)], x);
+        p.line_segment([at(26.0, 18.0), at(18.0, 26.0)], x);
+        return;
+    }
+    if let Some(q) = wifi {
+        // Fan from the tip at (22, 26), full radius 8: grey track, blue level.
+        let wedge = |radius: f32, fill: Color32| {
+            let tip = at(22.0, 26.0);
+            let mut pts = vec![tip];
+            for i in 0..=12 {
+                let a = std::f32::consts::PI * (1.25 + 0.5 * i as f32 / 12.0);
+                pts.push(tip + vec2(a.cos(), a.sin()) * radius * s);
+            }
+            p.add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+        };
+        let level = if q >= 70 { 1.0 } else if q >= 40 { 0.72 } else { 0.48 };
+        wedge(8.0, pal.border);
+        wedge(8.0 * level, pal.accent);
+    }
+}

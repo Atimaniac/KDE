@@ -632,6 +632,8 @@ pub enum Hotkey {
     ShowDesktop,
     /// Alt+Tab and the keys used while the window switcher is open.
     Switch(SwitchKey),
+    /// Ctrl+Shift+Esc.
+    TaskManager,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -672,6 +674,14 @@ unsafe extern "system" fn switch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
                 ctx.request_repaint();
             }
             return CallNextHookEx(null_mut(), code, wp, lp);
+        }
+        // Ctrl+Shift+Esc: Delfin's task manager.
+        if down && !open && k.vkCode == 0x1B && GetAsyncKeyState(0x11) < 0 && shift {
+            if let Some((tx, ctx)) = HOOK_OUT.get() {
+                let _ = tx.lock().map(|t| t.send(Hotkey::TaskManager));
+                ctx.request_repaint();
+            }
+            return 1;
         }
         let key = match k.vkCode {
             0x09 if alt || open => Some(if shift { SwitchKey::Prev } else { SwitchKey::Next }),

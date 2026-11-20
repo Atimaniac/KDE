@@ -13,7 +13,7 @@ mod quick;
 mod startmenu;
 mod startup;
 mod tray;
-mod win;
+pub(crate) mod win;
 
 use crate::config::Config;
 use crate::fsops::{self, natural_cmp};
@@ -164,6 +164,8 @@ struct ShellApp {
     quick_closed_at: Instant,
     vol_state: Option<(f32, bool)>,
     wifi_sig: Option<u32>,
+    /// An Ethernet adapter is up and routed.
+    wired: bool,
     last_status_poll: Instant,
     store_apps: Receiver<Vec<AppEntry>>,
     // calendar under the clock
@@ -301,6 +303,7 @@ impl ShellApp {
             quick_closed_at: long_ago,
             vol_state: None,
             wifi_sig: None,
+            wired: false,
             last_status_poll: long_ago,
             store_apps: startmenu::scan_store_apps(cc.egui_ctx.clone()),
             calendar_open: false,
@@ -797,6 +800,10 @@ impl ShellApp {
                             self.unshelve_all();
                         }
                     }
+                    let mut replaced = crate::taskmgr::replaced();
+                    if ui.checkbox(&mut replaced, tr("Replace Windows Task Manager (asks for administrator rights)")).changed() {
+                        let _ = crate::taskmgr::replace(replaced);
+                    }
                     let armed = self
                         .power_armed
                         .is_some_and(|(p, t)| p == Power::BackToExplorer && t.elapsed() < Duration::from_secs(5));
@@ -841,6 +848,7 @@ impl ShellApp {
         }
         self.vol_state = self.qp.volume_state();
         self.wifi_sig = self.qp.wifi_signal();
+        self.wired = quick::wired_connected();
     }
 
     fn quick_viewport(&mut self, ctx: &egui::Context, pal: &Palette, section: quick::Section) {
@@ -1147,10 +1155,11 @@ impl ShellApp {
                                     }
                                 }
                                 quick::Section::Network => {
-                                    quick::paint_wifi(p, r, pal.text, pal.dim.gamma_multiply(0.5), self.wifi_sig);
+                                    quick::paint_network(p, r, pal, self.wifi_sig, self.wired);
                                     match self.qp.connected_ssid() {
                                         Some(ssid) => crate::i18n::trf("Wi-Fi: {}", &[&ssid]),
-                                        None => crate::i18n::tr("Network").to_string(),
+                                        None if self.wired => crate::i18n::tr("Ethernet: connected").to_string(),
+                                        None => crate::i18n::tr("No network connection").to_string(),
                                     }
                                 }
                             };
@@ -2252,6 +2261,11 @@ impl eframe::App for ShellApp {
                 }
                 win::Hotkey::ShowDesktop => self.show_desktop(),
                 win::Hotkey::Switch(key) => self.switch_key(key),
+                win::Hotkey::TaskManager => {
+                    if let Ok(me) = std::env::current_exe() {
+                        let _ = std::process::Command::new(me).arg("--taskmgr").spawn();
+                    }
+                }
             }
         }
 

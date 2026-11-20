@@ -55,6 +55,8 @@ struct Options {
     folders: bool,
     start_menu: bool,
     desktop: bool,
+    /// Open Delfin's task manager instead of taskmgr.exe (asks for admin rights).
+    taskmgr: bool,
 }
 
 // ------------------------------------------------------------------ install
@@ -149,6 +151,10 @@ fn install(o: Options) -> Result<(), String> {
         }
     }
     register_uninstall(&exe)?;
+    if o.taskmgr && !crate::taskmgr::replaced() {
+        // Windows shows its administrator prompt; saying no just skips this.
+        let _ = crate::taskmgr::replace(true);
+    }
     // These copy the exe to the same place (already there) and write the
     // registry: Winlogon "Shell" and the Directory/Drive open handlers.
     if o.shell {
@@ -204,6 +210,10 @@ fn switch_now() {
 // ------------------------------------------------------------------ uninstall
 
 fn uninstall(remove_settings: bool) -> Result<(), String> {
+    // Give taskmgr.exe back to Windows first (asks for administrator rights).
+    if crate::taskmgr::replaced() {
+        let _ = crate::taskmgr::replace(false);
+    }
     // Back to Explorer as shell and folder handler.
     crate::platform::uninstall_shell()?;
     for l in [start_menu_link(), desktop_link()].into_iter().flatten() {
@@ -258,7 +268,7 @@ pub fn run_install() -> Result<(), eframe::Error> {
 /// `--setup --silent`: install with the default choices (shell, folders,
 /// Start menu shortcut) without showing the wizard. Exit code 0 = success.
 pub fn run_install_silent() -> i32 {
-    let o = Options { shell: true, folders: true, start_menu: true, desktop: false };
+    let o = Options { shell: true, folders: true, start_menu: true, desktop: false, taskmgr: true };
     match install(o) {
         Ok(()) => 0,
         Err(e) => {
@@ -294,7 +304,7 @@ fn run(mode: Mode) -> Result<(), eframe::Error> {
             Ok(Box::new(Wizard {
                 mode,
                 page: Page::Options,
-                opts: Options { shell: true, folders: true, start_menu: true, desktop: false },
+                opts: Options { shell: true, folders: true, start_menu: true, desktop: false, taskmgr: true },
                 remove_settings: false,
                 result: Arc::new(Mutex::new(None)),
                 pal: theme::palette(dark),
@@ -392,6 +402,7 @@ impl Wizard {
         });
         ui.checkbox(&mut self.opts.start_menu, RichText::new(tr("Start menu shortcut")).size(14.0));
         ui.checkbox(&mut self.opts.desktop, RichText::new(tr("Desktop shortcut")).size(14.0));
+        ui.checkbox(&mut self.opts.taskmgr, RichText::new(tr("Replace Windows Task Manager (asks for administrator rights)")).size(14.0));
         ui.add_space(12.0);
         ui.label(RichText::new(trf("Installs to: {}", &[&install_dir().display()])).size(12.0).color(pal.dim));
         ui.label(RichText::new(tr("Only for your Windows account. No administrator rights needed.")).size(12.0).color(pal.dim));
