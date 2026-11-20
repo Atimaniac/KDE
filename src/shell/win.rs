@@ -663,6 +663,16 @@ unsafe extern "system" fn switch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
         let alt = k.flags & 0x20 != 0; // LLKHF_ALTDOWN
         let open = SWITCHER_OPEN.load(Ordering::Relaxed);
         let shift = GetAsyncKeyState(0x10) < 0;
+        // Letting go of Alt switches to the highlighted window, like Windows.
+        // The key itself must pass through, or Windows would think Alt is
+        // still held down.
+        if open && up && matches!(k.vkCode, 0x12 | 0xA4 | 0xA5) {
+            if let Some((tx, ctx)) = HOOK_OUT.get() {
+                let _ = tx.lock().map(|t| t.send(Hotkey::Switch(SwitchKey::Confirm)));
+                ctx.request_repaint();
+            }
+            return CallNextHookEx(null_mut(), code, wp, lp);
+        }
         let key = match k.vkCode {
             0x09 if alt || open => Some(if shift { SwitchKey::Prev } else { SwitchKey::Next }),
             0x25 if open => Some(SwitchKey::Prev),  // Left
@@ -727,18 +737,24 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
 
 // ----------------------------------------------------------------- window switcher
 
-/// Bring a window to the front from the Alt+Tab switcher.
-pub fn switch_to(h: isize) {
+/// While Alt is held, tap an unused key (0xE8): then releasing Alt doesn't
+/// open the menu bar of whatever window has the focus.
+pub fn mask_alt_menu() {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SwitchToThisWindow};
-    let hwnd = h as HWND;
     unsafe {
-        // Alt is usually still held. Tapping an unused key first keeps its
-        // release from opening the menu bar of the window we switch to.
         if GetAsyncKeyState(0x12) < 0 {
             keybd_event(0xE8, 0, 0, 0);
             keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
         }
+    }
+}
+
+/// Bring a window to the front from the Alt+Tab switcher.
+pub fn switch_to(h: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SwitchToThisWindow};
+    let hwnd = h as HWND;
+    unsafe {
+        mask_alt_menu();
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, 9 /* SW_RESTORE */);
         }

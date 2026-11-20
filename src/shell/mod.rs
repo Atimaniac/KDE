@@ -2492,6 +2492,7 @@ impl ShellApp {
             self.open_launcher(false);
             self.open_quick(None);
             self.calendar_open = false;
+            win::mask_alt_menu();
             win::SWITCHER_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
             self.switcher = Some(Switcher {
                 thumbs: vec![None; n],
