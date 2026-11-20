@@ -173,6 +173,8 @@ struct ShellApp {
     tray_checked: Instant,
     // Delfin settings window (language, updates, shell options)
     settings_open: bool,
+    /// Alt+Tab window switcher, while it is on screen.
+    switcher: Option<Switcher>,
     updater: crate::update::Updater,
     // shared
     textures: HashMap<String, Option<TextureHandle>>,
@@ -293,6 +295,7 @@ impl ShellApp {
             calendar_month: (2000, 1),
             tray_checked: long_ago,
             settings_open: false,
+            switcher: None,
             updater: crate::update::Updater::default(),
             textures: HashMap::new(),
             hotkeys: rx,
@@ -445,9 +448,24 @@ impl ShellApp {
         resp
     }
 
+    /// Open a link from the shell. Without Explorer, Windows' Settings app can't
+    /// start: the main Settings page opens Delfin's settings, the other pages
+    /// their classic Control Panel dialog (see `win::classic_settings`).
+    fn open_uri(&mut self, u: &str) {
+        if u == "ms-settings:" && !win::explorer_running() {
+            self.settings_open = true;
+        } else {
+            win::shell_open(u);
+        }
+    }
+
     fn launch(&mut self, l: &Launch) {
         match l {
             Launch::Cmd(c) if c == "delfin" => win::spawn_self(None),
+            Launch::Cmd(c) if c.starts_with("ms-settings:") => {
+                let c = c.clone();
+                self.open_uri(&c);
+            }
             Launch::Cmd(c) => {
                 let _ = win::run_cmdline(c);
             }
@@ -852,7 +870,7 @@ impl ShellApp {
         );
         match action {
             Some(quick::QuickAction::Open(uri)) => {
-                win::shell_open(uri);
+                self.open_uri(uri);
                 close = true;
             }
             Some(quick::QuickAction::Close) => close = true,
@@ -1244,7 +1262,7 @@ impl ShellApp {
                     }
                 }
                 PanelAction::Uri(u) => {
-                    win::shell_open(u);
+                    self.open_uri(u);
                 }
             }
         }
@@ -2148,7 +2166,7 @@ impl ShellApp {
                     self.wallpaper_path = None;
                 }
                 DeskAction::Uri(u) => {
-                    win::shell_open(u);
+                    self.open_uri(u);
                 }
             }
         }
@@ -2183,11 +2201,15 @@ impl eframe::App for ShellApp {
                     self.open_launcher(open);
                 }
                 win::Hotkey::ShowDesktop => self.show_desktop(),
+                win::Hotkey::Switch(key) => self.switch_key(key),
             }
         }
 
         self.panel_ui(ctx, &pal);
         self.desktop_viewport(ctx, &pal);
+        if self.switcher.is_some() {
+            self.switcher_viewport(ctx, &pal);
+        }
         if self.launcher_open {
             self.launcher_viewport(ctx, &pal);
         }
@@ -2414,6 +2436,228 @@ fn paint_category(p: &egui::Painter, r: Rect, cat: Category, pal: &Palette) {
             p.circle_stroke(c, s * 0.9, st);
             p.line_segment([c, c - vec2(0.0, s * 0.55)], st);
             p.line_segment([c, c + vec2(s * 0.4, s * 0.2)], st);
+        }
+    }
+}
+
+// ----------------------------------------------------------------- Alt+Tab
+
+const SW_CARD: egui::Vec2 = egui::Vec2::new(236.0, 188.0);
+const SW_GAP: f32 = 14.0;
+const SW_PAD: f32 = 22.0;
+const SW_TITLE: &str = "Delfin Switcher";
+
+/// The Alt+Tab window switcher: one card per window with a live DWM preview.
+struct Switcher {
+    items: Vec<win::TaskWindow>,
+    sel: usize,
+    cols: usize,
+    opened: Instant,
+    /// DWM thumbnail per item, registered once our window exists.
+    thumbs: Vec<Option<isize>>,
+    registered: bool,
+}
+
+impl Drop for Switcher {
+    fn drop(&mut self) {
+        for t in self.thumbs.iter().flatten() {
+            win::thumb_unregister(*t);
+        }
+        win::SWITCHER_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
+}
+
+impl ShellApp {
+    fn switch_key(&mut self, key: win::SwitchKey) {
+        use win::SwitchKey as K;
+        let Some(sw) = &mut self.switcher else {
+            // Closed: Alt+Tab opens it on the previous window (Shift: the last).
+            if !matches!(key, K::Next | K::Prev) {
+                return;
+            }
+            let items = win::task_windows(self.own_pid);
+            if items.is_empty() {
+                return;
+            }
+            let n = items.len();
+            let sel = match key {
+                K::Prev => n - 1,
+                _ => (n > 1) as usize,
+            };
+            self.open_launcher(false);
+            self.open_quick(None);
+            self.calendar_open = false;
+            win::SWITCHER_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.switcher = Some(Switcher {
+                thumbs: vec![None; n],
+                items,
+                sel,
+                cols: 1,
+                opened: Instant::now(),
+                registered: false,
+            });
+            return;
+        };
+        let n = sw.items.len();
+        match key {
+            K::Next => sw.sel = (sw.sel + 1) % n,
+            K::Prev => sw.sel = (sw.sel + n - 1) % n,
+            K::Up if sw.sel >= sw.cols => sw.sel -= sw.cols,
+            K::Down if sw.sel + sw.cols < n => sw.sel += sw.cols,
+            K::Up | K::Down => {}
+            K::Confirm => {
+                let h = sw.items[sw.sel].hwnd;
+                self.switcher = None;
+                win::switch_to(h);
+                self.last_fg = h;
+            }
+            K::Cancel => self.switcher = None,
+        }
+    }
+
+    fn switcher_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let screen = Self::screen_points(ctx);
+        let ppp = ctx.pixels_per_point();
+        let Some(sw) = &mut self.switcher else { return };
+        let n = sw.items.len();
+        let max_cols = (((screen.x * 0.9 - 2.0 * SW_PAD + SW_GAP) / (SW_CARD.x + SW_GAP)).floor() as usize).max(1);
+        sw.cols = n.min(max_cols).max(1);
+        let rows = n.div_ceil(sw.cols);
+        let size = vec2(
+            2.0 * SW_PAD + sw.cols as f32 * (SW_CARD.x + SW_GAP) - SW_GAP,
+            2.0 * SW_PAD + rows as f32 * (SW_CARD.y + SW_GAP) - SW_GAP,
+        );
+        let builder = ViewportBuilder::default()
+            .with_title(SW_TITLE)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_visible(false)
+            .with_inner_size(size)
+            .with_position([(screen.x - size.x) / 2.0, (screen.y - size.y) / 2.0]);
+
+        let mut clicked: Option<usize> = None;
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_switcher"), builder, |ctx, _| {
+            // Shown without taking the focus: the keyboard hook drives it.
+            if !win::reveal_popup(SW_TITLE, false) {
+                ctx.request_repaint();
+                return;
+            }
+            let Some(sw) = &mut self.switcher else { return };
+            if !sw.registered {
+                if let Some(dest) = win::find_window(SW_TITLE) {
+                    for (i, it) in sw.items.iter().enumerate() {
+                        sw.thumbs[i] = win::thumb_register(dest, it.hwnd);
+                    }
+                    sw.registered = true;
+                }
+            }
+            // Fade and grow in over 160 ms.
+            let t = ease_out(sw.opened.elapsed().as_secs_f32() / 0.16);
+            if t < 1.0 {
+                ctx.request_repaint();
+            }
+            let items = sw.items.clone();
+            let (sel, cols) = (sw.sel, sw.cols);
+            let thumbs = sw.thumbs.clone();
+
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window.gamma_multiply(0.94 * t + 0.06)))
+                .show(ctx, |ui| {
+                    let origin = ui.max_rect().min + vec2(SW_PAD, SW_PAD);
+                    let card_at = |i: usize| {
+                        let (r, c) = (i / cols, i % cols);
+                        Rect::from_min_size(
+                            origin + vec2(c as f32 * (SW_CARD.x + SW_GAP), r as f32 * (SW_CARD.y + SW_GAP)),
+                            SW_CARD,
+                        )
+                    };
+                    let grow = 0.92 + 0.08 * t;
+
+                    // The highlight glides to the selected card.
+                    let target = card_at(sel);
+                    let hx = ctx.animate_value_with_time(egui::Id::new("sw_hx"), target.left(), 0.12);
+                    let hy = ctx.animate_value_with_time(egui::Id::new("sw_hy"), target.top(), 0.12);
+                    if (hx - target.left()).abs() > 0.5 || (hy - target.top()).abs() > 0.5 {
+                        ctx.request_repaint();
+                    }
+                    let hl = Rect::from_min_size(pos2(hx, hy), SW_CARD).expand(4.0);
+                    ui.painter().rect(hl, 10.0, pal.select, Stroke::new(2.0_f32, pal.accent));
+
+                    for (i, it) in items.iter().enumerate() {
+                        let full = card_at(i);
+                        let card = Rect::from_center_size(full.center(), full.size() * grow);
+                        let resp = ui.interact(card, ui.id().with(("sw", i)), Sense::click());
+                        if i != sel {
+                            let bg = if resp.hovered() { pal.hover } else { pal.header.gamma_multiply(0.6) };
+                            ui.painter().rect_filled(card, 8.0, bg);
+                        }
+                        if resp.clicked() {
+                            clicked = Some(i);
+                        }
+                        // Preview area and caption.
+                        let area = Rect::from_min_max(card.min + vec2(10.0, 10.0), pos2(card.right() - 10.0, card.bottom() - 36.0));
+                        let icon = self.tex_window(ctx, it.hwnd);
+                        let thumb = thumbs.get(i).copied().flatten();
+                        let live = !it.minimized && thumb.is_some();
+                        if let Some(id) = thumb {
+                            let (sw_px, sh_px) = win::thumb_source_size(id);
+                            let fit = if sw_px > 0 && sh_px > 0 {
+                                // Fit inside the area, never larger than the window itself.
+                                let s = (area.width() * ppp / sw_px as f32).min(area.height() * ppp / sh_px as f32).min(1.0);
+                                Rect::from_center_size(area.center(), vec2(sw_px as f32 * s / ppp, sh_px as f32 * s / ppp))
+                            } else {
+                                area
+                            };
+                            win::thumb_update(
+                                id,
+                                [
+                                    (fit.left() * ppp) as i32,
+                                    (fit.top() * ppp) as i32,
+                                    (fit.right() * ppp) as i32,
+                                    (fit.bottom() * ppp) as i32,
+                                ],
+                                (255.0 * t) as u8,
+                                live,
+                            );
+                        }
+                        if !live {
+                            // Minimised (or no preview): the big icon instead.
+                            let ir = Rect::from_center_size(area.center(), vec2(48.0, 48.0));
+                            match &icon {
+                                Some(tx) => {
+                                    ui.painter().image(tx.id(), ir, uv_full(), Color32::WHITE.gamma_multiply(t));
+                                }
+                                None => icons::paint_tool(ui.painter(), ir, Tool::Desktop, pal.dim),
+                            }
+                        }
+                        let cap = Rect::from_min_max(pos2(card.left() + 10.0, card.bottom() - 30.0), pos2(card.right() - 10.0, card.bottom() - 6.0));
+                        let ir = Rect::from_min_size(pos2(cap.left(), cap.center().y - 9.0), vec2(18.0, 18.0));
+                        if let Some(tx) = &icon {
+                            ui.painter().image(tx.id(), ir, uv_full(), Color32::WHITE.gamma_multiply(t));
+                        }
+                        let p = ui.painter().with_clip_rect(cap);
+                        p.text(
+                            pos2(ir.right() + 6.0, cap.center().y),
+                            Align2::LEFT_CENTER,
+                            &it.title,
+                            FontId::proportional(13.0),
+                            if i == sel { pal.text } else { pal.dim }.gamma_multiply(t),
+                        );
+                    }
+                });
+        });
+        if let Some(i) = clicked {
+            if let Some(sw) = &mut self.switcher {
+                sw.sel = i;
+            }
+            self.switch_key(win::SwitchKey::Confirm);
         }
     }
 }

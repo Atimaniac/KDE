@@ -3,6 +3,8 @@
 
 mod app;
 mod config;
+#[cfg(windows)]
+mod display;
 mod fsops;
 mod i18n;
 mod icons;
@@ -29,6 +31,9 @@ fn main() -> Result<(), eframe::Error> {
     // what Windows Settings › Apps runs).
     #[cfg(windows)]
     {
+        if has("--display") {
+            return display::run();
+        }
         if has("--uninstall") {
             return setup::run_uninstall();
         }

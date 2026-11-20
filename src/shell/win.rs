@@ -11,7 +11,7 @@ use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::Sender;
 
-use windows_sys::Win32::Foundation::{GetLastError, BOOL, HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{GetLastError, BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
@@ -215,6 +215,7 @@ pub fn reveal_popup(title: &str, activate: bool) -> bool {
         let ex = GetWindowLongPtrW(hw, -20 /* GWL_EXSTYLE */);
         let ex = (ex | 0x80 /* WS_EX_TOOLWINDOW */) & !0x4_0000 /* WS_EX_APPWINDOW */;
         SetWindowLongPtrW(hw, -20, ex);
+        round_corners(h);
         ShowWindow(hw, if activate { 5 /* SW_SHOW */ } else { 4 /* SW_SHOWNOACTIVATE */ });
         if activate {
             SetForegroundWindow(hw);
@@ -559,6 +560,13 @@ pub fn spawn_self(arg: Option<&Path>) {
 /// handler), and the panel must never freeze while it does. Unlike the `open`
 /// crate it never starts PowerShell or falls back to explorer.exe.
 pub fn shell_open(target: impl AsRef<std::ffi::OsStr>) {
+    let t = target.as_ref().to_string_lossy().to_string();
+    if t.starts_with("ms-settings:") && !explorer_running() {
+        if let Some((exe, args)) = classic_settings(&t) {
+            let _ = Command::new(exe).args(args).spawn();
+            return;
+        }
+    }
     let w = wide(target.as_ref());
     std::thread::spawn(move || unsafe {
         use windows_sys::Win32::System::Com::CoInitializeEx;
@@ -568,6 +576,34 @@ pub fn shell_open(target: impl AsRef<std::ffi::OsStr>) {
         let verb = wide("open");
         ShellExecuteW(null_mut(), verb.as_ptr(), w.as_ptr(), null(), null(), 1 /* SW_SHOWNORMAL */);
     });
+}
+
+/// Is Windows Explorer running as a shell (owning the taskbar)?
+pub fn explorer_running() -> bool {
+    find_class("Shell_TrayWnd").is_some_and(|h| pid_of(h) != std::process::id())
+}
+
+/// Windows' Settings app can't start without Explorer. These pages have a
+/// classic counterpart that still works (or Delfin's own display window).
+pub fn classic_settings(uri: &str) -> Option<(String, Vec<String>)> {
+    let page = uri.trim_start_matches("ms-settings:").to_lowercase();
+    let cpl = |name: &str| Some(("rundll32.exe".to_string(), vec!["shell32.dll,Control_RunDLL".to_string(), name.to_string()]));
+    match page.as_str() {
+        p if p.starts_with("display") || p.starts_with("personalization") => {
+            let me = std::env::current_exe().ok()?;
+            Some((me.to_string_lossy().to_string(), vec!["--display".to_string()]))
+        }
+        p if p.starts_with("sound") => cpl("mmsys.cpl"),
+        "apps-volume" => Some(("sndvol.exe".to_string(), Vec::new())),
+        p if p.starts_with("network") => cpl("ncpa.cpl"),
+        p if p.starts_with("dateandtime") => cpl("timedate.cpl"),
+        p if p.starts_with("bluetooth") => cpl("bthprops.cpl"),
+        p if p.starts_with("powersleep") || p.starts_with("batterysaver") => cpl("powercfg.cpl"),
+        p if p.starts_with("mousetouchpad") => cpl("main.cpl"),
+        p if p.starts_with("regionformatting") || p.starts_with("regionlanguage") => cpl("intl.cpl"),
+        p if p.starts_with("appsfeatures") => cpl("appwiz.cpl"),
+        _ => None,
+    }
 }
 
 /// Run a command line the way the Run dialog does (`start "" <cmd>`).
@@ -594,6 +630,62 @@ pub enum Hotkey {
     FileManager,
     Launcher,
     ShowDesktop,
+    /// Alt+Tab and the keys used while the window switcher is open.
+    Switch(SwitchKey),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SwitchKey {
+    Next,
+    Prev,
+    Up,
+    Down,
+    Confirm,
+    Cancel,
+}
+
+/// The window switcher is on screen: the keyboard hook then also takes the
+/// arrows, Enter and Esc (the switcher never takes the keyboard focus).
+pub static SWITCHER_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HOOK_OUT: std::sync::OnceLock<(std::sync::Mutex<Sender<Hotkey>>, egui::Context)> = std::sync::OnceLock::new();
+
+/// Low-level keyboard hook: Alt+Tab opens Delfin's switcher instead of the
+/// Windows one, then Tab / arrows move, Enter switches, Esc cancels.
+unsafe extern "system" fn switch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, KBDLLHOOKSTRUCT};
+    if code == 0 {
+        let k = &*(lp as *const KBDLLHOOKSTRUCT);
+        let msg = wp as u32;
+        let down = msg == 0x0100 || msg == 0x0104; // WM_KEYDOWN, WM_SYSKEYDOWN
+        let up = msg == 0x0101 || msg == 0x0105;
+        let alt = k.flags & 0x20 != 0; // LLKHF_ALTDOWN
+        let open = SWITCHER_OPEN.load(Ordering::Relaxed);
+        let shift = GetAsyncKeyState(0x10) < 0;
+        let key = match k.vkCode {
+            0x09 if alt || open => Some(if shift { SwitchKey::Prev } else { SwitchKey::Next }),
+            0x25 if open => Some(SwitchKey::Prev),  // Left
+            0x27 if open => Some(SwitchKey::Next),  // Right
+            0x26 if open => Some(SwitchKey::Up),
+            0x28 if open => Some(SwitchKey::Down),
+            0x0D if open => Some(SwitchKey::Confirm), // Enter
+            0x1B if open => Some(SwitchKey::Cancel),  // Esc
+            _ => None,
+        };
+        if let Some(key) = key {
+            if down {
+                if let Some((tx, ctx)) = HOOK_OUT.get() {
+                    let _ = tx.lock().map(|t| t.send(Hotkey::Switch(key)));
+                    ctx.request_repaint();
+                }
+            }
+            if down || up {
+                return 1; // swallow: Windows' own switcher never sees it
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
 }
 
 /// Global shortcuts. They are free once explorer.exe isn't running.
@@ -611,6 +703,12 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
         for (id, m, vk) in keys {
             RegisterHotKey(null_mut(), id, m, vk);
         }
+        let _ = HOOK_OUT.set((std::sync::Mutex::new(tx.clone()), ctx.clone()));
+        {
+            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowsHookExW;
+            SetWindowsHookExW(13 /* WH_KEYBOARD_LL */, Some(switch_hook), GetModuleHandleW(null()), 0);
+        }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             if msg.message == 0x0312 {
@@ -625,4 +723,70 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
             }
         }
     });
+}
+
+// ----------------------------------------------------------------- window switcher
+
+/// Bring a window to the front from the Alt+Tab switcher.
+pub fn switch_to(h: isize) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SwitchToThisWindow};
+    let hwnd = h as HWND;
+    unsafe {
+        // Alt is usually still held. Tapping an unused key first keeps its
+        // release from opening the menu bar of the window we switch to.
+        if GetAsyncKeyState(0x12) < 0 {
+            keybd_event(0xE8, 0, 0, 0);
+            keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+        }
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, 9 /* SW_RESTORE */);
+        }
+        SetForegroundWindow(hwnd);
+        if GetForegroundWindow() != hwnd {
+            SwitchToThisWindow(hwnd, 1);
+        }
+    }
+}
+
+/// Live preview of `src` drawn by DWM into our window `dest` (no copying).
+pub fn thumb_register(dest: isize, src: isize) -> Option<isize> {
+    use windows_sys::Win32::Graphics::Dwm::DwmRegisterThumbnail;
+    let mut id = 0isize;
+    let hr = unsafe { DwmRegisterThumbnail(dest as HWND, src as HWND, &mut id) };
+    (hr >= 0 && id != 0).then_some(id)
+}
+
+/// Size of the window behind a thumbnail, in pixels.
+pub fn thumb_source_size(id: isize) -> (i32, i32) {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Dwm::DwmQueryThumbnailSourceSize;
+    let mut s = SIZE { cx: 0, cy: 0 };
+    unsafe { DwmQueryThumbnailSourceSize(id, &mut s) };
+    (s.cx, s.cy)
+}
+
+/// Place a thumbnail at `rect` (client pixels of the destination window).
+pub fn thumb_update(id: isize, rect: [i32; 4], opacity: u8, visible: bool) {
+    use windows_sys::Win32::Graphics::Dwm::{DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES};
+    let p = DWM_THUMBNAIL_PROPERTIES {
+        dwFlags: 0x1 | 0x4 | 0x8 | 0x10, // RECTDESTINATION | OPACITY | VISIBLE | SOURCECLIENTAREAONLY
+        rcDestination: RECT { left: rect[0], top: rect[1], right: rect[2], bottom: rect[3] },
+        rcSource: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+        opacity,
+        fVisible: visible as BOOL,
+        fSourceClientAreaOnly: 0,
+    };
+    unsafe { DwmUpdateThumbnailProperties(id, &p) };
+}
+
+pub fn thumb_unregister(id: isize) {
+    unsafe { windows_sys::Win32::Graphics::Dwm::DwmUnregisterThumbnail(id) };
+}
+
+/// Windows 11 rounded corners (and the matching shadow) for a pop-up.
+pub fn round_corners(h: isize) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    let pref: i32 = 2; // DWMWCP_ROUND
+    unsafe { DwmSetWindowAttribute(h as HWND, 33, &pref as *const i32 as *const c_void, 4) };
 }
