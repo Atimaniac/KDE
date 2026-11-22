@@ -3307,7 +3307,8 @@ impl Drop for Preview {
 
 impl ShellApp {
     fn update_preview(&mut self, hover: Option<(isize, f32)>) {
-        if self.switcher.is_some() || self.launcher_open {
+        // No preview over a right-click menu: it would cover the menu's buttons.
+        if self.switcher.is_some() || self.launcher_open || self.panel_menu.is_some() {
             self.preview = None;
             return;
         }
@@ -3619,6 +3620,7 @@ impl ShellApp {
     }
 
     fn open_pin_menu(&mut self, i: usize, x: f32, wins: Vec<isize>) {
+        self.preview = None;
         let Some(pin) = self.pins.get(i).cloned() else { return };
         let mut items = vec![(
             if wins.is_empty() { crate::i18n::tr("Open").to_string() } else { crate::i18n::tr("New window").to_string() },
@@ -3637,6 +3639,7 @@ impl ShellApp {
     }
 
     fn open_task_menu(&mut self, h: isize, x: f32) {
+        self.preview = None;
         let title = self.tasks.iter().find(|t| t.hwnd == h).map(|t| t.title.clone()).unwrap_or_default();
         let mut items = Vec::new();
         let exe = win::window_exe(h);
