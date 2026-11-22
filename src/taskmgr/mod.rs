@@ -394,6 +394,7 @@ impl TaskMgr {
 
 impl eframe::App for TaskMgr {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        sys::WANT_GPU_TEMP.store(self.page == Page::Performance, std::sync::atomic::Ordering::Relaxed);
         let pal = self.pal;
         let snap = self.snap.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let s = &snap;

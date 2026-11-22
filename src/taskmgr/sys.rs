@@ -223,10 +223,27 @@ impl Pdh {
 
 // ------------------------------------------------------------------ GPU temperature (NVIDIA)
 
+/// NVIDIA's management library, only for the GPU temperature. It costs
+/// ~20 MB, so it is loaded only while the Performance page is open (see
+/// `WANT_GPU_TEMP`) and unloaded again after.
 struct Nvml {
     temp: unsafe extern "C" fn(*mut c_void, u32, *mut u32) -> i32,
     dev: *mut c_void,
+    shutdown: unsafe extern "C" fn() -> i32,
+    lib: windows_sys::Win32::Foundation::HMODULE,
 }
+
+impl Drop for Nvml {
+    fn drop(&mut self) {
+        unsafe {
+            (self.shutdown)();
+            windows_sys::Win32::Foundation::FreeLibrary(self.lib);
+        }
+    }
+}
+
+/// The Performance page is showing: read the GPU temperature (loads NVML).
+pub static WANT_GPU_TEMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 unsafe impl Send for Nvml {}
 
@@ -248,14 +265,18 @@ impl Nvml {
                 std::mem::transmute(GetProcAddress(lib, b"nvmlDeviceGetHandleByIndex_v2\0".as_ptr())?);
             let temp: unsafe extern "C" fn(*mut c_void, u32, *mut u32) -> i32 =
                 std::mem::transmute(GetProcAddress(lib, b"nvmlDeviceGetTemperature\0".as_ptr())?);
+            let shutdown: unsafe extern "C" fn() -> i32 = std::mem::transmute(GetProcAddress(lib, b"nvmlShutdown\0".as_ptr())?);
             if init() != 0 {
+                windows_sys::Win32::Foundation::FreeLibrary(lib);
                 return None;
             }
             let mut dev = null_mut();
             if handle(0, &mut dev) != 0 {
+                shutdown();
+                windows_sys::Win32::Foundation::FreeLibrary(lib);
                 return None;
             }
-            Some(Nvml { temp, dev })
+            Some(Nvml { temp, dev, shutdown, lib })
         }
     }
 
@@ -441,7 +462,9 @@ pub fn start(ctx: eframe::egui::Context) -> Arc<Mutex<Snapshot>> {
 
 fn sampler(ctx: eframe::egui::Context, out: Arc<Mutex<Snapshot>>) {
     let pdh = Pdh::open();
-    let nvml = Nvml::load();
+    let mut nvml: Option<Nvml> = None;
+    // No NVIDIA library on this PC: don't keep trying.
+    let mut nvml_missing = false;
     let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
     let cpu_name = cpu_name();
     let gpu_name = gpu_name();
@@ -458,6 +481,15 @@ fn sampler(ctx: eframe::egui::Context, out: Arc<Mutex<Snapshot>>) {
     let mut first = true;
 
     loop {
+        // Load or drop NVIDIA's library as the Performance page opens and closes.
+        if WANT_GPU_TEMP.load(std::sync::atomic::Ordering::Relaxed) {
+            if nvml.is_none() && !nvml_missing {
+                nvml = Nvml::load();
+                nvml_missing = nvml.is_none();
+            }
+        } else {
+            nvml = None;
+        }
         let elapsed = last.elapsed().as_secs_f64().max(0.001);
         last = Instant::now();
         if let Some(p) = &pdh {
