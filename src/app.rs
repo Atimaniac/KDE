@@ -1372,6 +1372,18 @@ impl App {
 
                         ui.add_space(8.0);
                         section(ui, crate::i18n::tr("Devices"), pal);
+                        // This PC: its full specification (Settings › System › About), like Windows.
+                        let pc = place_row(ui, PlaceIcon::Computer, crate::i18n::tr("This PC"), false, None, pal)
+                            .on_hover_text(crate::i18n::tr("Specification of this PC"));
+                        pc.context_menu(|ui| {
+                            if ui.button(crate::i18n::tr("Properties")).clicked() {
+                                open_pc_properties();
+                                ui.close_menu();
+                            }
+                        });
+                        if pc.clicked() {
+                            open_pc_properties();
+                        }
                         for d in &self.drives {
                             let cap = (d.total > 0).then(|| 1.0 - d.free as f32 / d.total as f32);
                             let r =
@@ -1859,6 +1871,7 @@ fn section(ui: &mut Ui, title: &str, pal: &Palette) {
 enum PlaceIcon {
     Folder,
     Drive,
+    Computer,
 }
 
 fn place_row(
@@ -1885,6 +1898,7 @@ fn place_row(
         match icon {
             PlaceIcon::Folder => icons::paint_folder(p, ir, icons::FOLDER),
             PlaceIcon::Drive => icons::paint_drive(p, ir),
+            PlaceIcon::Computer => icons::paint_tool(p, ir, icons::Tool::Desktop, pal.text),
         }
         let text_rect =
             Rect::from_min_max(pos2(rect.left() + 30.0, rect.top()), rect.right_bottom());
@@ -2470,3 +2484,14 @@ fn details_view(
     pane.scroll_offset = o.state.offset.y;
     pane.viewport_h = o.inner_rect.height();
 }
+
+/// This PC › Properties: Delfin's Settings at System › About.
+#[cfg(windows)]
+fn open_pc_properties() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).args(["--settings", "about"]).spawn();
+    }
+}
+
+#[cfg(not(windows))]
+fn open_pc_properties() {}

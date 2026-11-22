@@ -846,3 +846,177 @@ pub fn set_bluetooth(on: bool) -> bool {
     }
     false
 }
+
+// ------------------------------------------------------------------ full hardware report
+
+#[derive(Clone, Default)]
+pub struct Cpu {
+    pub name: String,
+    pub cores: u32,
+    pub threads: u32,
+    pub mhz: u32,
+    pub l2_kb: u32,
+    pub l3_kb: u32,
+    pub socket: String,
+    pub virtualization: Option<bool>,
+}
+
+#[derive(Clone, Default)]
+pub struct MemModule {
+    pub size: u64,
+    pub speed: u32,
+    pub kind: String,
+    pub maker: String,
+    pub part: String,
+    pub slot: String,
+}
+
+#[derive(Clone, Default)]
+pub struct Gpu {
+    pub name: String,
+    pub memory: u64,
+    pub driver: String,
+    pub driver_date: String,
+}
+
+#[derive(Clone, Default)]
+pub struct PhysDisk {
+    pub name: String,
+    pub media: String,
+    pub bus: String,
+    pub size: u64,
+    pub health: String,
+}
+
+#[derive(Clone, Default)]
+pub struct Hardware {
+    pub cpu: Cpu,
+    pub modules: Vec<MemModule>,
+    pub slots: u32,
+    pub installed_ram: u64,
+    pub usable_ram: u64,
+    pub gpus: Vec<Gpu>,
+    pub disks: Vec<PhysDisk>,
+    pub board: String,
+    pub bios: String,
+    pub bios_date: String,
+    pub firmware: String,
+    pub secure_boot: Option<bool>,
+    pub domain: String,
+    pub uptime_secs: u64,
+}
+
+const HW_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
+foreach($p in Get-CimInstance Win32_Processor){ "CPU`t$($p.Name)`t$($p.NumberOfCores)`t$($p.NumberOfLogicalProcessors)`t$($p.MaxClockSpeed)`t$($p.L2CacheSize)`t$($p.L3CacheSize)`t$($p.SocketDesignation)`t$($p.VirtualizationFirmwareEnabled)" }
+foreach($m in Get-CimInstance Win32_PhysicalMemory){ "MEM`t$($m.Capacity)`t$($m.ConfiguredClockSpeed)`t$($m.SMBIOSMemoryType)`t$($m.Manufacturer)`t$($m.PartNumber)`t$($m.DeviceLocator)" }
+"SLOTS`t" + ((Get-CimInstance Win32_PhysicalMemoryArray | Measure-Object MemoryDevices -Sum).Sum)
+foreach($g in Get-CimInstance Win32_VideoController){ "GPU`t$($g.Name)`t$($g.DriverVersion)`t$(if($g.DriverDate){$g.DriverDate.ToString('yyyy-MM-dd')})" }
+foreach($d in Get-PhysicalDisk){ "DISK`t$($d.FriendlyName)`t$($d.MediaType)`t$($d.BusType)`t$($d.Size)`t$($d.HealthStatus)" }
+$cs = Get-CimInstance Win32_ComputerSystem; "CS`t$($cs.Domain)`t$($cs.PartOfDomain)"
+"#;
+
+/// Everything about this PC's hardware (slow: a second or two).
+pub fn hardware() -> Hardware {
+    let mut hw = Hardware::default();
+    if let Some(out) = powershell(HW_SCRIPT) {
+        for line in out.lines() {
+            let f: Vec<&str> = line.split('\t').map(str::trim).collect();
+            let n = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let s = |i: usize| f.get(i).map(|v| v.to_string()).unwrap_or_default();
+            match f.first().copied() {
+                Some("CPU") if hw.cpu.name.is_empty() => {
+                    hw.cpu = Cpu {
+                        name: s(1),
+                        cores: n(2) as u32,
+                        threads: n(3) as u32,
+                        mhz: n(4) as u32,
+                        l2_kb: n(5) as u32,
+                        l3_kb: n(6) as u32,
+                        socket: s(7),
+                        virtualization: match s(8).as_str() {
+                            "True" => Some(true),
+                            "False" => Some(false),
+                            _ => None,
+                        },
+                    }
+                }
+                Some("MEM") => hw.modules.push(MemModule {
+                    size: n(1),
+                    speed: n(2) as u32,
+                    kind: match n(3) {
+                        20 => "DDR",
+                        21 => "DDR2",
+                        24 => "DDR3",
+                        26 => "DDR4",
+                        27 => "LPDDR",
+                        28 => "LPDDR2",
+                        29 => "LPDDR3",
+                        30 => "LPDDR4",
+                        34 => "DDR5",
+                        35 => "LPDDR5",
+                        _ => "",
+                    }
+                    .to_string(),
+                    maker: s(4),
+                    part: s(5),
+                    slot: s(6),
+                }),
+                Some("SLOTS") => hw.slots = n(1) as u32,
+                Some("GPU") => hw.gpus.push(Gpu { name: s(1), memory: 0, driver: s(2), driver_date: s(3) }),
+                Some("DISK") => hw.disks.push(PhysDisk { name: s(1), media: s(2), bus: s(3), size: n(4), health: s(5) }),
+                Some("CS") => {
+                    if s(2) == "True" {
+                        hw.domain = s(1);
+                    } else {
+                        hw.domain = format!("WORKGROUP:{}", s(1));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Graphics memory: WMI stops at 4 GB, the driver's own record doesn't.
+    if let Some(k) = hklm(r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}") {
+        for sub in k.enum_keys().flatten() {
+            let Ok(a) = k.open_subkey(&sub) else { continue };
+            let desc = a.get_value::<String, _>("DriverDesc").unwrap_or_default();
+            let mem = a
+                .get_value::<u64, _>("HardwareInformation.qwMemorySize")
+                .ok()
+                .or_else(|| a.get_raw_value("HardwareInformation.MemorySize").ok().and_then(|v| {
+                    let b = v.bytes;
+                    (b.len() >= 4).then(|| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
+                }));
+            if let (Some(m), Some(g)) = (mem, hw.gpus.iter_mut().find(|g| g.name == desc)) {
+                g.memory = m;
+            }
+        }
+    }
+    if let Some(k) = hklm(r"HARDWARE\DESCRIPTION\System\BIOS") {
+        let v = |n: &str| k.get_value::<String, _>(n).unwrap_or_default();
+        hw.board = format!("{} {}", v("BaseBoardManufacturer"), v("BaseBoardProduct")).trim().to_string();
+        hw.bios = format!("{} {}", v("BIOSVendor"), v("BIOSVersion")).trim().to_string();
+        hw.bios_date = v("BIOSReleaseDate");
+    }
+    hw.secure_boot = hklm(r"SYSTEM\CurrentControlSet\Control\SecureBoot\State")
+        .and_then(|k| k.get_value::<u32, _>("UEFISecureBootEnabled").ok())
+        .map(|v| v == 1);
+    unsafe {
+        use windows_sys::Win32::System::SystemInformation::{GetFirmwareType, GetPhysicallyInstalledSystemMemory, GetTickCount64};
+        let mut t = 0;
+        if GetFirmwareType(&mut t) != 0 {
+            hw.firmware = match t {
+                1 => "BIOS (Legacy)".into(),
+                2 => "UEFI".into(),
+                _ => String::new(),
+            };
+        }
+        let mut kb = 0u64;
+        if GetPhysicallyInstalledSystemMemory(&mut kb) != 0 {
+            hw.installed_ram = kb * 1024;
+        }
+        hw.uptime_secs = GetTickCount64() / 1000;
+    }
+    hw.usable_ram = about().ram;
+    hw
+}

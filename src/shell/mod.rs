@@ -1697,6 +1697,19 @@ ui.ctx().request_repaint();
                                 None => icons::paint_folder(ui.painter(), ir, icons::FOLDER),
                             }
                             ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, *label, FontId::proportional(13.5), pal.text);
+                            // This PC › Properties: the full specification, like in Windows.
+                            if k == 0 {
+                                resp.context_menu(|ui| {
+                                    if ui.button(crate::i18n::tr("Open")).clicked() {
+                                        launch = Some((Launch::Cmd("delfin".into()), None));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button(crate::i18n::tr("Properties")).clicked() {
+                                        launch = Some((Launch::Cmd("ms-settings:about".into()), None));
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
                             if resp.clicked() {
                                 match k {
                                     0 => launch = Some((Launch::Cmd("delfin".into()), None)),
@@ -2181,6 +2194,7 @@ impl eframe::App for ShellApp {
                         let _ = std::process::Command::new(me).arg("--taskmgr").spawn();
                     }
                 }
+                win::Hotkey::SystemInfo => self.open_uri("ms-settings:about"),
             }
         }
 

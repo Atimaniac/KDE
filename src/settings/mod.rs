@@ -422,6 +422,11 @@ struct Settings {
     class_icons: HashMap<u128, Option<TextureHandle>>,
     bt: Slot<Option<bool>>,
     bt_v: Option<Option<bool>>,
+    /// The full hardware report (About), read in the background.
+    hw: Slot<sys::Hardware>,
+    hw_v: Option<sys::Hardware>,
+    /// Displays for the report: "name	resolution".
+    screens: Vec<String>,
     updater: crate::update::Updater,
     rename: Option<String>,
     armed: Option<(String, Instant)>,
@@ -493,6 +498,9 @@ impl Settings {
             class_icons: HashMap::new(),
             bt: Arc::new(Mutex::new(None)),
             bt_v: None,
+            hw: Arc::new(Mutex::new(None)),
+            hw_v: None,
+            screens: Vec::new(),
             updater: crate::update::Updater::default(),
             rename: None,
             armed: None,
@@ -586,6 +594,20 @@ impl Settings {
                 self.bt = spawn(ctx, sys::bluetooth);
             }
             Page::Mouse => self.mouse = Some(sys::mouse()),
+            Page::About => {
+                if self.hw_v.is_none() {
+                    self.hw = spawn(ctx, sys::hardware);
+                }
+                self.adapters = spawn(ctx, sys::adapters);
+                self.screens = crate::display::monitors()
+                    .iter()
+                    .map(|m| {
+                        let c = m.current;
+                        let main = if m.primary { tr(" (main)") } else { "" };
+                        format!("{}{main}	{} × {}, {} Hz", m.name, c.w, c.h, c.hz)
+                    })
+                    .collect();
+            }
             Page::Network => {
                 self.qp().wifi.set_active(true);
                 self.adapters = spawn(ctx, sys::adapters);
@@ -753,6 +775,9 @@ impl Settings {
         }
         if let Some(v) = take(&self.devices) {
             self.devices_v = Some(v);
+        }
+        if let Some(v) = take(&self.hw) {
+            self.hw_v = Some(v);
         }
         if let Some(v) = take(&self.bt) {
             self.bt_v = Some(v);
@@ -2017,6 +2042,8 @@ impl Settings {
             });
         });
 
+        self.hardware_sections(ui, lk, &format!("{dev_text}{win_text}"));
+
         section(ui, tr("Related"));
         if ext_row(ui, lk, Ico::Chip, tr("Device Manager"), tr("Hardware and drivers")) {
             spawn_self(&["--devmgr"]);
@@ -2032,6 +2059,178 @@ impl Settings {
         }
         if ext_row(ui, lk, Ico::Globe, tr("Domain or workgroup"), "") {
             sys::start("SystemPropertiesComputerName.exe");
+        }
+    }
+
+    /// The full specification under About, like Windows' own "About" with
+    /// everything a technician would ask for. `head` is the part shown above.
+    fn hardware_sections(&mut self, ui: &mut Ui, lk: Look, head: &str) {
+        let pal = lk.pal;
+        let Some(hw) = self.hw_v.clone() else {
+            section(ui, tr("Full specification"));
+            card(ui, lk, |ui| {
+                ui.label(RichText::new(tr("Reading the hardware…")).color(pal.dim));
+            });
+            return;
+        };
+        let gb = |b: u64| fmt_bytes(b as f64);
+        let yes_no = |v: bool| if v { tr("On").to_string() } else { tr("Off").to_string() };
+        // (section title, lines of label / value)
+        let mut sections: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+
+        let c = &hw.cpu;
+        let mut cpu = vec![(tr("Name").to_string(), c.name.clone())];
+        if c.cores > 0 {
+            cpu.push((tr("Cores / threads").to_string(), format!("{} / {}", c.cores, c.threads)));
+        }
+        if c.mhz > 0 {
+            let mut ghz = format!("{:.2} GHz", c.mhz as f64 / 1000.0);
+            if crate::i18n::lang() == crate::i18n::Lang::Pl {
+                ghz = ghz.replace('.', ",");
+            }
+            cpu.push((tr("Base speed").to_string(), ghz));
+        }
+        let cache: Vec<String> = [("L2", c.l2_kb), ("L3", c.l3_kb)]
+            .iter()
+            .filter(|(_, kb)| *kb > 0)
+            .map(|(n, kb)| format!("{n} {}", gb(*kb as u64 * 1024)))
+            .collect();
+        if !cache.is_empty() {
+            cpu.push((tr("Cache").to_string(), cache.join("  ·  ")));
+        }
+        if !c.socket.is_empty() {
+            cpu.push((tr("Socket").to_string(), c.socket.clone()));
+        }
+        if let Some(v) = c.virtualization {
+            cpu.push((tr("Virtualization").to_string(), yes_no(v)));
+        }
+        sections.push((tr("Processor"), cpu));
+
+        let mut mem = vec![(
+            tr("Installed").to_string(),
+            trf("{} ({} usable)", &[&gb(hw.installed_ram.max(hw.usable_ram)), &gb(hw.usable_ram)]),
+        )];
+        if let Some(m) = hw.modules.first() {
+            let mut kind = m.kind.clone();
+            if m.speed > 0 {
+                kind = format!("{kind} {} MT/s", m.speed).trim().to_string();
+            }
+            if !kind.is_empty() {
+                mem.push((tr("Type and speed").to_string(), kind));
+            }
+        }
+        if hw.slots > 0 {
+            mem.push((tr("Slots").to_string(), trf("{} of {} used", &[&hw.modules.len(), &hw.slots])));
+        }
+        for m in &hw.modules {
+            let what = [gb(m.size), m.maker.clone(), m.part.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
+            mem.push((m.slot.clone(), what));
+        }
+        sections.push((tr("Memory"), mem));
+
+        let mut gpu = Vec::new();
+        for g in &hw.gpus {
+            gpu.push((tr("Name").to_string(), g.name.clone()));
+            if g.memory > 0 {
+                gpu.push((tr("Graphics memory").to_string(), gb(g.memory)));
+            }
+            if !g.driver.is_empty() {
+                let d = if g.driver_date.is_empty() { g.driver.clone() } else { format!("{}  ({})", g.driver, g.driver_date) };
+                gpu.push((tr("Driver").to_string(), d));
+            }
+        }
+        sections.push((tr("Graphics"), gpu));
+
+        let mut disks = Vec::new();
+        for d in &hw.disks {
+            let kind = [d.media.as_str(), d.bus.as_str()].iter().filter(|s| !s.is_empty() && **s != "Unspecified").copied().collect::<Vec<_>>().join(" · ");
+            let health = match d.health.as_str() {
+                "Healthy" => tr("Healthy").to_string(),
+                "Warning" => tr("Warning").to_string(),
+                "Unhealthy" => tr("Failing").to_string(),
+                h => h.to_string(),
+            };
+            let v = [gb(d.size), kind, health].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
+            disks.push((d.name.clone(), v));
+        }
+        sections.push((tr("Disks"), disks));
+
+        let screens: Vec<(String, String)> = self
+            .screens
+            .iter()
+            .map(|s| {
+                let (a, b) = s.split_once('\t').unwrap_or((s, ""));
+                (a.to_string(), b.to_string())
+            })
+            .collect();
+        sections.push((tr("Displays"), screens));
+
+        let mut fw = Vec::new();
+        if !hw.board.is_empty() {
+            fw.push((tr("Motherboard").to_string(), hw.board.clone()));
+        }
+        if !hw.bios.is_empty() {
+            let b = if hw.bios_date.is_empty() { hw.bios.clone() } else { format!("{}  ({})", hw.bios, hw.bios_date) };
+            fw.push(("BIOS".to_string(), b));
+        }
+        if !hw.firmware.is_empty() {
+            fw.push((tr("Firmware").to_string(), hw.firmware.clone()));
+        }
+        if let Some(sb) = hw.secure_boot {
+            fw.push(("Secure Boot".to_string(), yes_no(sb)));
+        }
+        sections.push((tr("Motherboard and firmware"), fw));
+
+        let mut net = Vec::new();
+        for a in self.adapters_v.iter().flatten().filter(|a| a.up) {
+            let v = [a.description.clone(), a.ipv4.join(", "), a.mac.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
+            net.push((a.name.clone(), v));
+        }
+        sections.push((tr("Network"), net));
+
+        let up = hw.uptime_secs;
+        let (d, h, m) = (up / 86400, up % 86400 / 3600, up % 3600 / 60);
+        let uptime = if d > 0 { trf("{} d {} h {} min", &[&d, &h, &m]) } else { trf("{} h {} min", &[&h, &m]) };
+        let mut sysl = vec![(tr("Up time").to_string(), uptime)];
+        if let Some(wg) = hw.domain.strip_prefix("WORKGROUP:") {
+            sysl.push((tr("Workgroup").to_string(), wg.to_string()));
+        } else if !hw.domain.is_empty() {
+            sysl.push((tr("Domain").to_string(), hw.domain.clone()));
+        }
+        sections.push((tr("System"), sysl));
+
+        // The whole report, for support requests and forums.
+        let mut all = head.to_string();
+        for (title, lines) in &sections {
+            if lines.is_empty() {
+                continue;
+            }
+            all += &format!("\n{title}\n");
+            for (k, v) in lines {
+                all += &format!("{k}\t{v}\n");
+            }
+        }
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tr("Full specification")).size(14.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if button(ui, tr("Copy everything")).clicked() {
+                    ui.ctx().copy_text(all.clone());
+                    self.say(tr("The full specification is copied."), false);
+                }
+            });
+        });
+        ui.add_space(5.0);
+        for (title, lines) in &sections {
+            if lines.is_empty() {
+                continue;
+            }
+            section(ui, title);
+            card(ui, lk, |ui| {
+                for (k, v) in lines {
+                    kv(ui, &pal, k, v);
+                }
+            });
         }
     }
 

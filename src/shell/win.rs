@@ -624,6 +624,8 @@ pub enum Hotkey {
     Switch(SwitchKey),
     /// Ctrl+Shift+Esc.
     TaskManager,
+    /// Win+Pause: this PC's specification.
+    SystemInfo,
     /// Keyboard media keys: next, previous, play / pause, stop.
     Media(MediaKey),
     /// Keyboard volume keys (also volume knobs and sliders): +1 up, -1 down, 0 mute.
@@ -746,11 +748,12 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
         const MOD_ALT: u32 = 0x1;
         const MOD_WIN: u32 = 0x8;
         const NOREPEAT: u32 = 0x4000;
-        let keys: [(i32, u32, u32); 4] = [
+        let keys: [(i32, u32, u32); 5] = [
             (1, MOD_WIN | NOREPEAT, b'E' as u32), // Win+E  → file manager
             (2, MOD_ALT | NOREPEAT, 0x70),        // Alt+F1 → launcher (KDE default)
             (3, MOD_WIN | NOREPEAT, b'D' as u32), // Win+D  → show desktop
             (4, MOD_WIN | NOREPEAT, b'R' as u32), // Win+R  → launcher (run)
+            (5, MOD_WIN | NOREPEAT, 0x13),        // Win+Pause → system specification
         ];
         for (id, m, vk) in keys {
             RegisterHotKey(null_mut(), id, m, vk);
@@ -789,6 +792,7 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
                     1 => Hotkey::FileManager,
                     2 | 4 => Hotkey::Launcher,
                     3 => Hotkey::ShowDesktop,
+                    5 => Hotkey::SystemInfo,
                     _ => continue,
                 };
                 let _ = tx.send(k);
