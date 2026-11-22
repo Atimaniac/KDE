@@ -26,6 +26,11 @@ pub struct Config {
     pub minimize_to_tray: bool,
     /// User-added entries in the Places panel.
     pub places: Vec<PathBuf>,
+    /// Shell: Aero glass (translucent, blurred panel, start menu and pop-ups).
+    pub aero: bool,
+    /// Glass colour (RGB) and how strong it is (0–100).
+    pub aero_color: [u8; 3],
+    pub aero_strength: u8,
 }
 
 impl Default for Config {
@@ -42,6 +47,9 @@ impl Default for Config {
             folders_first: true,
             minimize_to_tray: false,
             places: Vec::new(),
+            aero: false,
+            aero_color: [0x74, 0xb8, 0xfc],
+            aero_strength: 45,
         }
     }
 }
@@ -91,6 +99,17 @@ impl Config {
                     }
                 }
                 "place" => c.places.push(PathBuf::from(v)),
+                "aero" => c.aero = v == "1",
+                "aero_color" => {
+                    if let Ok(x) = u32::from_str_radix(v.trim_start_matches('#'), 16) {
+                        c.aero_color = [(x >> 16) as u8, (x >> 8) as u8, x as u8];
+                    }
+                }
+                "aero_strength" => {
+                    if let Ok(x) = v.parse::<u8>() {
+                        c.aero_strength = x.min(100);
+                    }
+                }
                 _ => {}
             }
         }
@@ -126,6 +145,9 @@ impl Config {
                 SortBy::Type => "type",
             }
         );
+        s += &format!("aero={}\n", b(self.aero));
+        s += &format!("aero_color={:02x}{:02x}{:02x}\n", self.aero_color[0], self.aero_color[1], self.aero_color[2]);
+        s += &format!("aero_strength={}\n", self.aero_strength);
         for p in &self.places {
             s += &format!("place={}\n", p.display());
         }

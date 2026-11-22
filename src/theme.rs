@@ -175,3 +175,45 @@ pub fn app_icon() -> std::sync::Arc<egui::IconData> {
         rgba: img.into_raw(),
     })
 }
+
+/// Colours for Aero glass: the dark palette with see-through surfaces tinted
+/// in `color`. `strength` (0–100) is how much colour and how little see-through.
+pub fn glass_palette(color: [u8; 3], strength: u8) -> Palette {
+    let mut p = palette(true);
+    let s = strength.min(100) as f32 / 100.0;
+    let shade = |k: f32, a: f32| {
+        Color32::from_rgba_unmultiplied(
+            (color[0] as f32 * k) as u8,
+            (color[1] as f32 * k) as u8,
+            (color[2] as f32 * k) as u8,
+            a.clamp(0.0, 255.0) as u8,
+        )
+    };
+    p.window = shade(0.30 + 0.25 * s, 80.0 + 130.0 * s);
+    p.header = shade(0.42 + 0.25 * s, 110.0 + 110.0 * s);
+    p.view = Color32::from_rgba_unmultiplied(8, 10, 14, 120);
+    p.alt_row = Color32::from_rgba_unmultiplied(255, 255, 255, 10);
+    p.border = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
+    p.hover = Color32::from_rgba_unmultiplied(255, 255, 255, 34);
+    p.select = shade(0.9, 120.0);
+    p.dim = hex(0xd2dae2);
+    p
+}
+
+/// The shell's look changed (dark mode, Aero): tell a running shell.
+#[cfg(windows)]
+pub fn notify_shell() {
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent};
+    let name: Vec<u16> = SHELL_EVENT.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let ev = OpenEventW(0x0002 /* EVENT_MODIFY_STATE */, 0, name.as_ptr());
+        if !ev.is_null() {
+            SetEvent(ev);
+            windows_sys::Win32::Foundation::CloseHandle(ev);
+        }
+    }
+}
+
+/// Signalled when the shell should read its look from the settings again.
+#[cfg(windows)]
+pub const SHELL_EVENT: &str = r"Local\DelfinShellLook";

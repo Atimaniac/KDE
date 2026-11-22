@@ -52,6 +52,7 @@ pub fn run() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title(PANEL_TITLE)
+            .with_transparent(true)
             .with_app_id("delfin-panel")
             .with_decorations(false)
             .with_resizable(false)
@@ -192,6 +193,8 @@ struct ShellApp {
     panel_menu: Option<PanelMenu>,
     /// Commands picked in menus inside other windows (launcher, desktop).
     menu_cmds: Vec<MenuCmd>,
+    /// Windows whose blur (Aero) was set, and to what.
+    aero_applied: HashMap<isize, bool>,
 }
 
 /// Remember shelved windows on disk so they can be shown again if the shell
@@ -220,7 +223,8 @@ impl ShellApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let cfg = Config::load();
-        theme::apply(&cc.egui_ctx, cfg.dark);
+        theme::apply(&cc.egui_ctx, cfg.dark || cfg.aero);
+        spawn_look_waiter(cc.egui_ctx.clone());
 
         let (tx, rx) = channel();
         win::spawn_hotkeys(tx, cc.egui_ctx.clone());
@@ -325,6 +329,7 @@ impl ShellApp {
             exe_of_window: HashMap::new(),
             panel_menu: None,
             menu_cmds: Vec::new(),
+            aero_applied: HashMap::new(),
         };
         app
     }
@@ -573,6 +578,7 @@ impl ShellApp {
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Calendar")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -702,6 +708,7 @@ impl ShellApp {
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title(tr("Delfin Settings"))
+            .with_transparent(true)
             .with_icon(theme::app_icon())
             .with_resizable(false)
             .with_inner_size([W, H])
@@ -857,6 +864,7 @@ impl ShellApp {
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Quick Settings")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -1060,6 +1068,7 @@ impl ShellApp {
     // ------------------------------------------------------------ panel
 
     fn panel_ui(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let aero = self.cfg.aero;
         let mut actions: Vec<PanelAction> = Vec::new();
         let mut task_hover: Option<(isize, f32)> = None;
         let mut hovered: Option<(String, f32)> = None;
@@ -1072,6 +1081,9 @@ impl ShellApp {
             )
             .show(ctx, |ui| {
                 let sr = ctx.screen_rect();
+                if aero {
+                    paint_gloss(ui.painter(), sr, 0.0);
+                }
                 ui.painter().line_segment(
                     [sr.left_top(), sr.right_top()],
                     Stroke::new(1.0_f32, pal.border),
@@ -1393,9 +1405,11 @@ impl ShellApp {
     // ------------------------------------------------------------ launcher
 
     fn launcher_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let aero = self.cfg.aero;
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Launcher")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -1481,6 +1495,9 @@ impl ShellApp {
                             .inner_margin(Margin::same(14.0)),
                     )
                     .show(ctx, |ui| {
+                        if aero {
+                            paint_gloss(ui.painter(), ctx.screen_rect(), 8.0);
+                        }
                         let full = ui.max_rect();
                         let left_w = 176.0;
                         let right_w = 176.0;
@@ -1799,6 +1816,7 @@ ui.ctx().request_repaint();
         let x = (screen.x - size.x - 260.0).max(0.0);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Tray")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -1909,6 +1927,7 @@ ui.ctx().request_repaint();
         let size = vec2(380.0, 104.0);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Notification")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -2003,6 +2022,7 @@ ui.ctx().request_repaint();
         let left = (x - size.x / 2.0).clamp(2.0, (screen.x - size.x - 2.0).max(2.0));
         let builder = ViewportBuilder::default()
             .with_title("Delfin Tooltip")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -2031,6 +2051,46 @@ ui.ctx().request_repaint();
                     });
             },
         );
+    }
+
+    // ------------------------------------------------------------ look (dark mode, Aero)
+
+    /// The colours of every shell surface: Aero glass or the normal theme.
+    fn palette(&self) -> Palette {
+        if self.cfg.aero {
+            theme::glass_palette(self.cfg.aero_color, self.cfg.aero_strength)
+        } else {
+            theme::palette(self.cfg.dark)
+        }
+    }
+
+    /// Settings changed the look: read it again and apply it now.
+    fn reload_look(&mut self, ctx: &egui::Context) {
+        let c = Config::load();
+        self.cfg.dark = c.dark;
+        self.cfg.aero = c.aero;
+        self.cfg.aero_color = c.aero_color;
+        self.cfg.aero_strength = c.aero_strength;
+        theme::apply(ctx, self.cfg.dark || self.cfg.aero);
+        self.aero_applied.clear();
+        ctx.request_repaint();
+    }
+
+    /// Turn the blur behind each shell window on or off to match the setting
+    /// (new pop-ups get it as they appear).
+    fn apply_aero(&mut self) {
+        let want = self.cfg.aero;
+        if !want && self.aero_applied.is_empty() {
+            return;
+        }
+        let wins = win::own_windows();
+        for &h in &wins {
+            if self.aero_applied.get(&h) != Some(&want) {
+                win::set_blur(h, want);
+                self.aero_applied.insert(h, want);
+            }
+        }
+        self.aero_applied.retain(|h, on| *on && wins.contains(h));
     }
 
     // ------------------------------------------------------------ desktop
@@ -2063,8 +2123,17 @@ ui.ctx().request_repaint();
 }
 
 impl eframe::App for ShellApp {
+    /// See-through windows (Aero glass); every surface paints its own background.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let pal = theme::palette(self.cfg.dark);
+        if LOOK_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.reload_look(ctx);
+        }
+        let pal = self.palette();
+        self.apply_aero();
         self.place_panel(ctx);
         self.poll();
         self.poll_status();
@@ -2447,6 +2516,7 @@ impl ShellApp {
         );
         let builder = ViewportBuilder::default()
             .with_title(SW_TITLE)
+            .with_transparent(true)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
@@ -2772,6 +2842,7 @@ impl ShellApp {
         let x = self.media_x.clamp(4.0, (screen.x - MEDIA_W - 4.0).max(4.0));
         let builder = ViewportBuilder::default()
             .with_title("Delfin Media")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -3016,6 +3087,7 @@ impl ShellApp {
         let x = (p.x - PREVIEW_W / 2.0).clamp(4.0, (screen.x - PREVIEW_W - 4.0).max(4.0));
         let builder = ViewportBuilder::default()
             .with_title(PREVIEW_TITLE)
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -3155,6 +3227,7 @@ impl ShellApp {
         let screen = Self::screen_points(ctx);
         let builder = ViewportBuilder::default()
             .with_title("Delfin Volume")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -3418,6 +3491,7 @@ impl ShellApp {
         let x = menu.x.clamp(4.0, (screen.x - MENU_W - 4.0).max(4.0));
         let builder = ViewportBuilder::default()
             .with_title("Delfin Menu")
+            .with_transparent(true)
             .with_visible(false)
             .with_decorations(false)
             .with_resizable(false)
@@ -3484,4 +3558,43 @@ impl ShellApp {
             self.panel_menu = None;
         }
     }
+}
+
+/// Settings changed dark mode or Aero (see `theme::notify_shell`).
+static LOOK_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn spawn_look_waiter(ctx: egui::Context) {
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+        let name: Vec<u16> = theme::SHELL_EVENT.encode_utf16().chain(Some(0)).collect();
+        let ev = CreateEventW(std::ptr::null(), 0, 0, name.as_ptr());
+        if ev.is_null() {
+            return;
+        }
+        while WaitForSingleObject(ev, INFINITE) == 0 {
+            LOOK_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.request_repaint();
+        }
+    });
+}
+
+/// Vista-style glass shine: a soft light band over the top half of a surface
+/// and a thin bright line just inside its top edge.
+fn paint_gloss(p: &egui::Painter, r: Rect, rounding: f32) {
+    let top = r.top() + rounding.min(2.0);
+    let mid = r.top() + r.height() * 0.48;
+    let mut mesh = egui::Mesh::default();
+    let hi = Color32::from_white_alpha(34);
+    let lo = Color32::from_white_alpha(8);
+    mesh.colored_vertex(pos2(r.left(), top), hi);
+    mesh.colored_vertex(pos2(r.right(), top), hi);
+    mesh.colored_vertex(pos2(r.right(), mid), lo);
+    mesh.colored_vertex(pos2(r.left(), mid), lo);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(Shape::mesh(mesh));
+    p.line_segment(
+        [pos2(r.left() + rounding, r.top() + 1.5), pos2(r.right() - rounding, r.top() + 1.5)],
+        Stroke::new(1.0_f32, Color32::from_white_alpha(70)),
+    );
 }

@@ -1033,3 +1033,55 @@ pub fn package_key_of_aumid(aumid: &str) -> Option<String> {
     let (name, publisher) = family.rsplit_once('_')?;
     Some(format!("{name}|{publisher}"))
 }
+
+// ----------------------------------------------------------------- Aero glass
+
+/// This process's top-level windows (the panel, its pop-ups; not the desktop).
+pub fn own_windows() -> Vec<isize> {
+    unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+        let out = &mut *(lp as *mut (u32, Vec<isize>));
+        let mut pid = 0;
+        GetWindowThreadProcessId(h, &mut pid);
+        if pid == out.0 {
+            let mut class = [0u16; 32];
+            let n = windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW(h, class.as_mut_ptr(), class.len() as i32);
+            if String::from_utf16_lossy(&class[..n.max(0) as usize]) != "DelfinDesktop" {
+                out.1.push(h as isize);
+            }
+        }
+        1
+    }
+    let mut st = (std::process::id(), Vec::new());
+    unsafe { EnumWindows(Some(each), &mut st as *mut _ as LPARAM) };
+    st.1
+}
+
+/// Blur what is behind a window (Aero glass), or stop doing so. The window's
+/// own see-through colours then show a blurred desktop and windows behind it.
+pub fn set_blur(h: isize, on: bool) {
+    #[repr(C)]
+    struct AccentPolicy {
+        state: u32,
+        flags: u32,
+        color: u32,
+        animation: u32,
+    }
+    #[repr(C)]
+    struct CompositionData {
+        attribute: u32,
+        data: *mut c_void,
+        size: usize,
+    }
+    type SetWca = unsafe extern "system" fn(HWND, *mut CompositionData) -> BOOL;
+    static FUNC: std::sync::OnceLock<Option<SetWca>> = std::sync::OnceLock::new();
+    let f = FUNC.get_or_init(|| unsafe {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let user32 = GetModuleHandleW(wide("user32.dll").as_ptr());
+        GetProcAddress(user32, c"SetWindowCompositionAttribute".as_ptr() as *const u8).map(|p| std::mem::transmute::<_, SetWca>(p))
+    });
+    let Some(f) = f else { return };
+    // ACCENT_ENABLE_BLURBEHIND = 3, ACCENT_DISABLED = 0; WCA_ACCENT_POLICY = 19.
+    let mut policy = AccentPolicy { state: if on { 3 } else { 0 }, flags: 0, color: 0, animation: 0 };
+    let mut data = CompositionData { attribute: 19, data: &mut policy as *mut _ as *mut c_void, size: std::mem::size_of::<AccentPolicy>() };
+    unsafe { f(h as HWND, &mut data) };
+}

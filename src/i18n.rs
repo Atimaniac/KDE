@@ -915,4 +915,21 @@ const PL: &[(&str, &str)] = &[
     // Media: go to the player
     ("the player", "odtwarzacz"),
     ("Go to {}\nRight-click: player controls", "Przejdź do: {}\nPrawy przycisk: sterowanie odtwarzaczem"),
+    // Aero glass
+    ("Aero glass", "Efekt Aero (szkło)"),
+    ("See-through, blurred taskbar, start menu and pop-ups, like Windows Vista", "Przezroczysty, rozmyty pasek zadań, menu start i okienka, jak w Windows Vista"),
+    ("Glass colour", "Kolor szkła"),
+    ("Colour intensity", "Intensywność koloru"),
+    ("Sky", "Niebo"),
+    ("Twilight", "Zmierzch"),
+    ("Sea foam", "Morska piana"),
+    ("Leaf", "Liść"),
+    ("Lime", "Limonka"),
+    ("Sun", "Słońce"),
+    ("Pumpkin", "Dynia"),
+    ("Ruby", "Rubin"),
+    ("Fuchsia", "Fuksja"),
+    ("Violet", "Fiolet"),
+    ("Graphite", "Grafit"),
+    ("Frost", "Szron"),
 ];

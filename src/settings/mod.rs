@@ -12,7 +12,7 @@ use crate::shell::quick::{self, QuickPanel};
 use crate::taskmgr::sys::{fmt_bytes, StartupItem};
 use crate::theme::{self, Palette};
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Layout, Margin, Rect, Response, RichText, ScrollArea, Sense,
+    self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Layout, Margin, Rect, Response, RichText, Rounding, ScrollArea, Sense,
     Shape, Stroke, TextureHandle, Ui,
 };
 use std::collections::{HashMap, HashSet};
@@ -441,6 +441,8 @@ struct Cached {
     transparency: bool,
     tm_replaced: bool,
     battery: Option<(u8, bool)>,
+    /// Aero settings shown on the Personalization page.
+    look: crate::config::Config,
 }
 
 impl Settings {
@@ -591,6 +593,7 @@ impl Settings {
             }
             Page::Personalization => {
                 self.cached.fit = sys::wallpaper_fit();
+                self.cached.look = crate::config::Config::load();
                 self.cached.transparency = sys::transparency();
                 self.wallpaper = sys::wallpaper();
                 self.load_wallpaper(ctx);
@@ -711,6 +714,7 @@ impl Settings {
         self.dark = dark;
         self.pal = theme::palette(dark);
         theme::apply(ctx, dark);
+        theme::notify_shell();
     }
 
     /// Pick up results from background threads.
@@ -1300,6 +1304,7 @@ enum Ico {
     Plus,
     Restart,
     Blank,
+    Glass,
 }
 
 fn arc_pts(c: egui::Pos2, r: f32, a0: f32, a1: f32) -> Vec<egui::Pos2> {
@@ -1456,6 +1461,12 @@ fn paint_ico(p: &egui::Painter, r: Rect, i: Ico, col: Color32, pal: &Palette) {
             p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
         }
         Ico::Blank => {}
+        Ico::Glass => {
+            p.rect_stroke(rr(-9.0, -7.0, 9.0, 7.0), 2.0, st);
+            line(vec![v(-9.0, 1.0), v(-4.0, -7.0)]);
+            line(vec![v(-6.0, 7.0), v(3.0, -7.0)]);
+            line(vec![v(1.0, 7.0), v(9.0, -5.0)]);
+        }
         Ico::Plus => {
             line(vec![v(-7.0, 0.0), v(7.0, 0.0)]);
             line(vec![v(0.0, -7.0), v(0.0, 7.0)]);
@@ -2370,6 +2381,70 @@ impl Settings {
             self.cached.transparency = tr_on;
         }
 
+        // Aero glass for Delfin's panel, start menu and pop-ups.
+        let mut cfg = self.cached.look.clone();
+        let mut changed = false;
+        row_with(
+            ui,
+            lk,
+            Some(Ico::Glass),
+            tr("Aero glass"),
+            tr("See-through, blurred taskbar, start menu and pop-ups, like Windows Vista"),
+            false,
+            160.0,
+            |ui| {
+                changed |= switch(ui, &pal, &mut cfg.aero);
+            },
+        );
+        if cfg.aero {
+            card(ui, lk, |ui| {
+                ui.label(RichText::new(tr("Glass colour")).color(pal.dim));
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(10.0, 8.0);
+                    for (name, rgb) in AERO_COLORS {
+                        let (r, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+                        let c = Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+                        let on = cfg.aero_color == [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
+                        ui.painter().rect_filled(r.shrink(3.0), 6.0, c);
+                        // A touch of the glass shine on each swatch.
+                        let top = Rect::from_min_max(r.shrink(3.0).min, pos2(r.shrink(3.0).right(), r.center().y));
+                        ui.painter().rect_filled(top, Rounding { nw: 6.0, ne: 6.0, sw: 0.0, se: 0.0 }, Color32::from_white_alpha(40));
+                        if on {
+                            ui.painter().rect_stroke(r, 8.0, Stroke::new(2.0_f32, pal.text));
+                        } else if resp.hovered() {
+                            ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0_f32, pal.border));
+                        }
+                        if resp.on_hover_text(tr(name)).clicked() && !on {
+                            cfg.aero_color = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
+                            changed = true;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr("Colour intensity")).color(pal.dim));
+                    ui.spacing_mut().slider_width = 260.0;
+                    let r = ui.add(egui::Slider::new(&mut cfg.aero_strength, 0..=100).show_value(false));
+                    // Save when the slider is let go, not on every step.
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        changed = true;
+                    }
+                    ui.label(format!("{}%", cfg.aero_strength));
+                });
+            });
+        }
+        if changed || cfg.aero_strength != self.cached.look.aero_strength {
+            self.cached.look = cfg.clone();
+        }
+        if changed {
+            let mut saved = crate::config::Config::load();
+            saved.aero = cfg.aero;
+            saved.aero_color = cfg.aero_color;
+            saved.aero_strength = cfg.aero_strength;
+            saved.save();
+            theme::notify_shell();
+        }
+
         section(ui, tr("Related settings"));
         if row(ui, lk, Some(Ico::Monitor), tr("Display"), tr("Resolution, orientation, brightness"), true).clicked() {
             self.go(ctx, Page::Display);
@@ -2855,3 +2930,19 @@ fn restart_shell() {
         .creation_flags(0x0800_0000)
         .spawn();
 }
+
+/// Glass colours to pick from, like Windows Vista's "Color and Appearance".
+const AERO_COLORS: [(&str, u32); 12] = [
+    ("Sky", 0x74b8fc),
+    ("Twilight", 0x3277b5),
+    ("Sea foam", 0x2fa9a8),
+    ("Leaf", 0x48a85a),
+    ("Lime", 0x9ccc3c),
+    ("Sun", 0xf2c430),
+    ("Pumpkin", 0xf0882c),
+    ("Ruby", 0xcc3333),
+    ("Fuchsia", 0xe872bf),
+    ("Violet", 0x8a6ad1),
+    ("Graphite", 0x6b6b6b),
+    ("Frost", 0xe8eef7),
+];
