@@ -30,6 +30,10 @@ fn key(p: &Path) -> String {
 /// The program a pin starts, to find its windows.
 fn exe_of(target: &Launch) -> Option<String> {
     match target {
+        // Store / MSIX apps: match windows by package.
+        Launch::Path(p) if super::win::packaged_app_id(&p.to_string_lossy()).is_some() => {
+            super::win::package_key_of_aumid(&super::win::packaged_app_id(&p.to_string_lossy())?).map(|k| format!("pkg:{k}"))
+        }
         Launch::Path(p) => {
             let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             match ext.as_str() {
@@ -57,6 +61,7 @@ impl Pin {
     /// Does this window's program belong to this pin?
     pub fn owns(&self, window_exe: &str) -> bool {
         match &self.exe {
+            Some(e) if e.starts_with("pkg:") => super::win::package_key_of_exe(window_exe).is_some_and(|k| k == e[4..]),
             Some(e) if e.starts_with('\\') => window_exe.ends_with(e.as_str()),
             Some(e) => window_exe == e,
             None => false,

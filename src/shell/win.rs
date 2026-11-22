@@ -573,6 +573,14 @@ pub fn shell_open(target: impl AsRef<std::ffi::OsStr>) {
         use windows_sys::Win32::UI::Shell::ShellExecuteW;
         // Apartment-threaded, no OLE1 DDE: what ShellExecute expects.
         CoInitializeEx(null(), 0x2 | 0x4);
+        // Store / MSIX apps (Claude, Paint, …): "shell:AppsFolder\…" needs
+        // Explorer ("Class not registered" without it), so start them the way
+        // Windows does underneath.
+        if let Some(aumid) = packaged_app_id(&t) {
+            if activate_packaged(&aumid) {
+                return;
+            }
+        }
         let verb = wide("open");
         ShellExecuteW(null_mut(), verb.as_ptr(), w.as_ptr(), null(), null(), 1 /* SW_SHOWNORMAL */);
     });
@@ -922,4 +930,54 @@ pub fn window_exe(h: isize) -> Option<PathBuf> {
         CloseHandle(p);
         ok.then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
     }
+}
+
+/// "Claude_pzs8sxrjxfjjc!Claude" from "shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude".
+pub fn packaged_app_id(target: &str) -> Option<String> {
+    let lower = target.to_lowercase();
+    let rest = lower.strip_prefix("shell:appsfolder\\").map(|_| &target["shell:AppsFolder\\".len()..])?;
+    rest.contains('!').then(|| rest.trim().to_string())
+}
+
+/// Start a packaged (Store / MSIX) app by its AppUserModelID through
+/// IApplicationActivationManager; works without Explorer. Needs COM.
+pub fn activate_packaged(aumid: &str) -> bool {
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::System::Com::CoCreateInstance;
+    const CLSID_AAM: GUID = GUID::from_u128(0x45ba127d_10a8_46ea_8ab7_56ea9078943c);
+    const IID_IAAM: GUID = GUID::from_u128(0x2e941141_7f97_4756_ba1d_9decde894a3d);
+    unsafe {
+        let mut obj: *mut c_void = null_mut();
+        if CoCreateInstance(&CLSID_AAM, null_mut(), 0x17 /* CLSCTX_ALL */, &IID_IAAM, &mut obj) < 0 || obj.is_null() {
+            return false;
+        }
+        let vtbl = *(obj as *const *const usize);
+        let activate: unsafe extern "system" fn(*mut c_void, *const u16, *const u16, u32, *mut u32) -> i32 =
+            std::mem::transmute(*vtbl.add(3));
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+        let id = wide(aumid);
+        let mut pid = 0u32;
+        let hr = activate(obj, id.as_ptr(), null(), 0, &mut pid);
+        release(obj);
+        hr >= 0
+    }
+}
+
+/// "claude|pzs8sxrjxfjjc" for a program inside C:\Program Files\WindowsApps
+/// (package name and publisher id), to match its windows to a pinned app.
+pub fn package_key_of_exe(exe: &str) -> Option<String> {
+    let l = exe.to_lowercase();
+    let marker = "\\windowsapps\\";
+    let i = l.find(marker)? + marker.len();
+    let folder = l[i..].split('\\').next()?;
+    let (head, publisher) = folder.split_once("__")?;
+    let name = head.split('_').next()?;
+    Some(format!("{name}|{publisher}"))
+}
+
+/// The same key from an AppUserModelID ("Claude_pzs8sxrjxfjjc!Claude").
+pub fn package_key_of_aumid(aumid: &str) -> Option<String> {
+    let family = aumid.split('!').next()?.to_lowercase();
+    let (name, publisher) = family.rsplit_once('_')?;
+    Some(format!("{name}|{publisher}"))
 }

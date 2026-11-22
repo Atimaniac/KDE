@@ -3535,10 +3535,30 @@ impl ShellApp {
             let n = e.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
             n != "applicationframehost.exe" && n != "explorer.exe"
         }) {
-            let name = startmenu::file_description(&exe)
-                .filter(|d| !d.trim().is_empty())
-                .unwrap_or_else(|| exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
-            items.push((crate::i18n::tr("Pin to taskbar").to_string(), MenuCmd::Pin(pins::Pin::new(name, Launch::Path(exe.clone())))));
+            // A Store / MSIX app (Claude, …) can't be started from its exe:
+            // pin its Start-menu entry ("shell:AppsFolder\…") instead.
+            let packaged = win::package_key_of_exe(&exe.to_string_lossy()).and_then(|key| {
+                self.apps
+                    .iter()
+                    .find(|a| match &a.target {
+                        Launch::Path(p) => win::packaged_app_id(&p.to_string_lossy())
+                            .and_then(|id| win::package_key_of_aumid(&id))
+                            .is_some_and(|k| k == key),
+                        _ => false,
+                    })
+                    .map(|a| pins::Pin::from_app(a))
+            });
+            let pin = packaged.unwrap_or_else(|| {
+                let name = startmenu::file_description(&exe)
+                    .filter(|d| !d.trim().is_empty())
+                    .unwrap_or_else(|| exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+                pins::Pin::new(name, Launch::Path(exe.clone()))
+            });
+            if self.pins.iter().any(|p| p.same_target(&pin.target)) {
+                items.push((crate::i18n::tr("Unpin from taskbar").to_string(), MenuCmd::Unpin(pin.target.clone())));
+            } else {
+                items.push((crate::i18n::tr("Pin to taskbar").to_string(), MenuCmd::Pin(pin)));
+            }
             items.push((crate::i18n::tr("Open file location").to_string(), MenuCmd::Location(exe.clone())));
             items.push((crate::i18n::tr("Properties").to_string(), MenuCmd::Props(exe)));
         }
