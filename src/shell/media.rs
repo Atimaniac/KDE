@@ -27,6 +27,8 @@ pub enum Repeat {
 #[derive(Clone, Default)]
 pub struct Track {
     pub app: String,
+    /// The player's app id (AUMID), to find its window.
+    pub source: String,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -199,6 +201,7 @@ fn snapshot(session: &Session, prev: Option<&Track>, gen: &mut u64) -> Option<Tr
         }
     };
     Some(Track {
+        source: session.SourceAppUserModelId().map(|s| s.to_string()).unwrap_or_default(),
         app: session.SourceAppUserModelId().map(|s| app_name(&s.to_string())).unwrap_or_default(),
         title,
         artist,

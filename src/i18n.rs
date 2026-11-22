@@ -912,4 +912,7 @@ const PL: &[(&str, &str)] = &[
     ("{} operating system", "System operacyjny {}"),
     ("{} used of {}  ·  {} free  ·  {}", "Użyto {} z {}  ·  wolne {}  ·  {}"),
     ("{} · {} items", "{} · elementów: {}"),
+    // Media: go to the player
+    ("the player", "odtwarzacz"),
+    ("Go to {}\nRight-click: player controls", "Przejdź do: {}\nPrawy przycisk: sterowanie odtwarzaczem"),
 ];

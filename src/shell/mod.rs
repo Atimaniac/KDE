@@ -11,6 +11,7 @@ pub mod install;
 mod media;
 pub(crate) mod pins;
 pub(crate) mod quick;
+mod source;
 mod startmenu;
 mod startup;
 mod tray;
@@ -85,6 +86,8 @@ enum Power {
 
 enum PanelAction {
     ToggleMedia,
+    /// Bring up the window (and browser tab) that plays.
+    GoToMedia,
     Media(media::Cmd),
     ToggleLauncher,
     Activate(isize),
@@ -1154,7 +1157,9 @@ impl ShellApp {
                     if let Some(track) = self.media.current() {
                         let (r, _) = ui.allocate_exact_size(vec2(340.0, 36.0), Sense::hover());
                         self.media_x = r.left();
-                        self.media_widget(ui, ctx, r, &track, pal, &mut actions);
+                        if let Some(t) = self.media_widget(ui, ctx, r, &track, pal, &mut actions) {
+                            hovered = Some((t, r.left() + 120.0));
+                        }
                         ui.separator();
                     } else if self.media_open {
                         self.media_open = false;
@@ -1387,6 +1392,13 @@ impl ShellApp {
                         self.open_quick(None);
                         self.open_launcher(false);
                         self.calendar_open = false;
+                        self.media_open = true;
+                        self.media_seen_focus = false;
+                    }
+                }
+                PanelAction::GoToMedia => {
+                    if !self.go_to_player() {
+                        // Nowhere to go (the player has no window): show the player instead.
                         self.media_open = true;
                         self.media_seen_focus = false;
                     }
@@ -2984,7 +2996,7 @@ impl ShellApp {
         track: &media::Track,
         pal: &Palette,
         actions: &mut Vec<PanelAction>,
-    ) {
+    ) -> Option<String> {
         let bw = 30.0;
         let buttons = Rect::from_min_max(pos2(r.right() - 3.0 * bw, r.top()), r.max);
         let info = Rect::from_min_max(r.min, pos2(buttons.left() - 4.0, r.bottom()));
@@ -3038,13 +3050,57 @@ impl ShellApp {
                 }));
             }
         }
+        // Click: go to the player (the browser tab that plays). Right-click: the player flyout.
         if resp.clicked() {
+            actions.push(PanelAction::GoToMedia);
+        }
+        if resp.secondary_clicked() {
             actions.push(PanelAction::ToggleMedia);
         }
         if resp.hovered() {
             // keep the time ticking while the pointer rests on it
             ctx.request_repaint_after(Duration::from_millis(500));
+            let app = if track.app.is_empty() { crate::i18n::tr("the player").to_string() } else { track.app.clone() };
+            return Some(crate::i18n::trf("Go to {}\nRight-click: player controls", &[&app]));
         }
+        None
+    }
+
+    /// Bring up the window that plays, and in a browser the tab that plays.
+    /// False when the player has no window to go to.
+    fn go_to_player(&mut self) -> bool {
+        let Some(track) = self.media.current() else { return false };
+        let candidates: Vec<source::Candidate> = self
+            .tasks
+            .iter()
+            .map(|t| source::Candidate {
+                hwnd: t.hwnd,
+                title: t.title.clone(),
+                exe: self.exe_of_window.get(&t.hwnd).cloned().flatten().unwrap_or_default(),
+            })
+            .collect();
+        let wins = source::player_windows(&track.source, &track.title, candidates);
+        let Some(first) = wins.first() else {
+            // A Store app playing in the background: start (show) it.
+            return track.source.contains('!') && win::activate_packaged(&track.source);
+        };
+        // Bring the window up right away (the click gives the panel the right to).
+        win::switch_to(first.hwnd);
+        let tl = track.title.to_lowercase();
+        let showing = !tl.is_empty() && first.title.to_lowercase().contains(&tl);
+        let browsers: Vec<isize> = wins.iter().filter(|w| source::is_browser(&source::stem(&w.exe))).map(|w| w.hwnd).collect();
+        if !browsers.is_empty() && !showing {
+            // Find the tab on another thread: the browser can take a moment to answer.
+            let (title, artist, shown) = (track.title.clone(), track.artist.clone(), first.hwnd);
+            std::thread::spawn(move || {
+                if let Some(h) = source::select_tab(&browsers, &title, &artist) {
+                    if h != shown {
+                        win::switch_to(h);
+                    }
+                }
+            });
+        }
+        true
     }
 
     /// The player flyout above the panel element.
