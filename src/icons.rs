@@ -247,6 +247,7 @@ pub enum Tool {
     Logout,
     Gear,
     Desktop,
+    Chip,
 }
 
 fn arc(c: Pos2, r: f32, a0: f32, a1: f32) -> Vec<Pos2> {
@@ -377,6 +378,17 @@ pub fn paint_tool(p: &Painter, rect: Rect, t: Tool, col: Color32) {
             let pi = std::f32::consts::PI;
             line(arc(c + vec2(0., 1.), 6.5, -pi / 2.0 + 0.7, 1.5 * pi - 0.7));
             line(vec![c + vec2(0., -7.), c + vec2(0., 0.)]);
+        }
+        Tool::Chip => {
+            // A chip with pins: Device Manager.
+            p.rect_stroke(Rect::from_center_size(c, vec2(10., 10.)), 1.5, s);
+            p.rect_filled(Rect::from_center_size(c, vec2(4., 4.)), 0.5, col);
+            for k in [-2.5f32, 0.0, 2.5] {
+                p.line_segment([c + vec2(k, -5.), c + vec2(k, -8.)], s);
+                p.line_segment([c + vec2(k, 5.), c + vec2(k, 8.)], s);
+                p.line_segment([c + vec2(-5., k), c + vec2(-8., k)], s);
+                p.line_segment([c + vec2(5., k), c + vec2(8., k)], s);
+            }
         }
         Tool::Lock => {
             let pi = std::f32::consts::PI;

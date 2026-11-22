@@ -71,6 +71,7 @@ pub fn scan() -> Vec<AppEntry> {
         builtin(crate::i18n::tr("Settings"), "ms-settings:", Tool::Gear, crate::i18n::tr("Windows settings")),
         builtin(crate::i18n::tr("Terminal"), "wt.exe", Tool::Terminal, crate::i18n::tr("Command line")),
         builtin(crate::i18n::tr("Task Manager"), "taskmgr.exe", Tool::Details, crate::i18n::tr("Running programs")),
+        builtin(crate::i18n::tr("Device Manager"), "devmgmt.msc", Tool::Chip, crate::i18n::tr("Hardware and drivers")),
         builtin(crate::i18n::tr("Control Panel"), "control.exe", Tool::Gear, crate::i18n::tr("Classic settings")),
         builtin(crate::i18n::tr("Calculator"), "calc.exe", Tool::Icons, crate::i18n::tr("Calculator")),
         builtin(crate::i18n::tr("Notepad"), "notepad.exe", Tool::Compact, crate::i18n::tr("Text editor")),
@@ -224,7 +225,7 @@ const KEYWORDS: &[(Category, &[&str])] = &[
     ]),
     (Category::System, &[
         "terminal", "powershell", "command prompt", "wiersz polece", "task manager",
-        "menedżer zadań", "control panel", "panel sterowania", "settings", "ustawienia",
+        "menedżer zadań", "device manager", "menedżer urządzeń", "control panel", "panel sterowania", "settings", "ustawienia",
         "regedit", "registry", "administrative", "windows tools", "narzędzia", "system",
         "notepad", "calculator", "kalkulator", "delfin", "explorer", "visual studio", "code",
         "git", "python", "node", "java", "driver", "nvidia", "amd", "intel", "backup", "7-zip",
@@ -367,7 +368,7 @@ unsafe fn com_release(obj: *mut std::ffi::c_void) {
 }
 
 /// (comment, target .exe) of a .lnk file, via IShellLinkW.
-fn shortcut_info(lnk: &Path) -> Option<(String, Option<PathBuf>)> {
+pub(crate) fn shortcut_info(lnk: &Path) -> Option<(String, Option<PathBuf>)> {
     use std::ffi::c_void;
     use windows_sys::core::GUID;
     use windows_sys::Win32::System::Com::CoCreateInstance;
@@ -412,7 +413,7 @@ fn from_wide(buf: &[u16]) -> String {
 }
 
 /// FileDescription from a program's version information.
-fn file_description(exe: &Path) -> Option<String> {
+pub(crate) fn file_description(exe: &Path) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
     let w = super::win::wide(exe.as_os_str());
     unsafe {

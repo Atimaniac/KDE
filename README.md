@@ -40,6 +40,15 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
   Manager* (installer, Delfin settings or `delfin.exe --replace-taskmgr on|off`, needs administrator
   rights once) every start of taskmgr.exe, also from Ctrl+Alt+Del, opens it; this uses the same
   "Image File Execution Options" entry as Process Explorer's "Replace Task Manager".
+- **Device Manager** (`delfin.exe --devmgr`, launcher → *Device Manager*, also `devmgmt.msc`): devices by type with
+  their status, driver and IDs; enable, disable, uninstall, scan for hardware changes, show hidden devices.
+  Opens instantly (no MMC console).
+- **Pinned apps**: right-click an app in the launcher, a window button, a desktop icon or a program in the
+  file manager → *Pin to taskbar*. Windows of a pinned app group under its icon (click to switch, middle
+  click for a new window, right-click for a menu).
+- **Properties** (`delfin.exe --props <file>`, right-click → *Properties*, Alt+Enter in the file manager):
+  General, Shortcut (edit target, arguments, start in…), Compatibility (compatibility mode, run as
+  administrator, high DPI…) and Details (version information, 32/64-bit).
 - **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher, `Alt+Tab` window
   switcher, `Ctrl+Shift+Esc` task manager.
 - Folders opened anywhere in Windows open in Delfin.

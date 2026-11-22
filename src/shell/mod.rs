@@ -9,6 +9,7 @@
 
 pub mod install;
 mod media;
+pub(crate) mod pins;
 mod quick;
 mod startmenu;
 mod startup;
@@ -89,8 +90,11 @@ enum PanelAction {
     Activate(isize),
     Minimize(isize),
     Close(isize),
-    FileManager,
-    Terminal,
+    LaunchPin(usize),
+    /// Right-click on a pin: (pin, x, its windows).
+    PinMenu(usize, f32, Vec<isize>),
+    /// Right-click on a window button.
+    TaskMenu(isize, f32),
     ToggleCalendar,
     Uri(&'static str),
     Tray(isize, u32, Click, f32),
@@ -197,6 +201,15 @@ struct ShellApp {
     // shared
     textures: HashMap<String, Option<TextureHandle>>,
     hotkeys: Receiver<win::Hotkey>,
+    // pinned apps
+    pins: Vec<pins::Pin>,
+    pins_mtime: Option<std::time::SystemTime>,
+    /// Program of each window (lower case), to group windows under pins.
+    exe_of_window: HashMap<isize, Option<String>>,
+    /// Right-click menu above the panel.
+    panel_menu: Option<PanelMenu>,
+    /// Commands picked in menus inside other windows (launcher, desktop).
+    menu_cmds: Vec<MenuCmd>,
 }
 
 /// Remember shelved windows on disk so they can be shown again if the shell
@@ -327,6 +340,11 @@ impl ShellApp {
             updater: crate::update::Updater::default(),
             textures: HashMap::new(),
             hotkeys: rx,
+            pins: pins::load(),
+            pins_mtime: pins::modified(),
+            exe_of_window: HashMap::new(),
+            panel_menu: None,
+            menu_cmds: Vec::new(),
         };
         app.load_desktop();
         app
@@ -490,6 +508,12 @@ impl ShellApp {
     fn launch(&mut self, l: &Launch) {
         match l {
             Launch::Cmd(c) if c == "delfin" => win::spawn_self(None),
+            // Delfin's own Device Manager instead of the slow MMC console.
+            Launch::Cmd(c) if is_devmgr_cmd(c) => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).arg("--devmgr").spawn();
+                }
+            }
             Launch::Cmd(c) if c.starts_with("ms-settings:") => {
                 let c = c.clone();
                 self.open_uri(&c);
@@ -1013,6 +1037,18 @@ impl ShellApp {
             .retain(|h, _| merged.iter().any(|t| t.hwnd == *h) || shelved.contains(h));
         self.hidden_for_desktop
             .retain(|h| merged.iter().any(|t| t.hwnd == *h));
+        self.exe_of_window.retain(|h, _| merged.iter().any(|t| t.hwnd == *h));
+        for t in &merged {
+            self.exe_of_window
+                .entry(t.hwnd)
+                .or_insert_with(|| win::window_exe(t.hwnd).map(|p| p.to_string_lossy().to_lowercase()));
+        }
+        // Pins changed elsewhere (the file manager can pin programs).
+        let m = pins::modified();
+        if m != self.pins_mtime {
+            self.pins_mtime = m;
+            self.pins = pins::load();
+        }
         self.tasks = merged;
     }
 
@@ -1067,20 +1103,40 @@ impl ShellApp {
                         actions.push(PanelAction::ToggleLauncher);
                     }
                     ui.add_space(4.0);
-                    if pinned_folder(ui, pal).clicked() {
-                        actions.push(PanelAction::FileManager);
-                    }
-                    if icons::tool_button_sized(
-                        ui,
-                        Tool::Terminal,
-                        false,
-                        true,
-                        "",
-                        vec2(36.0, 36.0),
-                    )
-                    .clicked()
-                    {
-                        actions.push(PanelAction::Terminal);
+                    // Pinned apps; their running windows group under them.
+                    let pins = self.pins.clone();
+                    let all_tasks = self.tasks.clone();
+                    for (pi, pin) in pins.iter().enumerate() {
+                        let wins: Vec<&win::TaskWindow> = all_tasks
+                            .iter()
+                            .filter(|t| self.exe_of_window.get(&t.hwnd).and_then(|e| e.as_deref()).is_some_and(|e| pin.owns(e)))
+                            .collect();
+                        let active = wins.iter().any(|t| t.hwnd == self.last_fg && !t.minimized);
+                        let r = self.pin_button(ui, ctx, pin, if active { 2 } else { (!wins.is_empty()) as u8 }, pal);
+                        if r.clicked() {
+                            actions.push(match wins.len() {
+                                0 => PanelAction::LaunchPin(pi),
+                                1 if active => PanelAction::Minimize(wins[0].hwnd),
+                                1 => PanelAction::Activate(wins[0].hwnd),
+                                // Several windows: go through them in turn.
+                                n => {
+                                    let cur = wins.iter().position(|t| t.hwnd == self.last_fg);
+                                    PanelAction::Activate(wins[cur.map(|c| (c + 1) % n).unwrap_or(0)].hwnd)
+                                }
+                            });
+                        }
+                        if r.middle_clicked() {
+                            actions.push(PanelAction::LaunchPin(pi));
+                        }
+                        if r.secondary_clicked() {
+                            actions.push(PanelAction::PinMenu(pi, r.rect.left(), wins.iter().map(|t| t.hwnd).collect()));
+                        }
+                        if r.hovered() {
+                            match wins.first() {
+                                Some(t) => task_hover = Some((t.hwnd, r.rect.center().x)),
+                                None => hovered = Some((pin.name.clone(), r.rect.center().x)),
+                            }
+                        }
                     }
                     ui.separator();
 
@@ -1096,9 +1152,18 @@ impl ShellApp {
 
                     let right_w = 200.0;
                     let avail = (ui.available_width() - right_w).max(40.0);
-                    let n = self.tasks.len().max(1) as f32;
+                    // Windows of pinned apps are shown on their pin instead.
+                    let tasks: Vec<win::TaskWindow> = self
+                        .tasks
+                        .iter()
+                        .filter(|t| {
+                            let exe = self.exe_of_window.get(&t.hwnd).and_then(|e| e.as_deref());
+                            !exe.is_some_and(|e| self.pins.iter().any(|p| p.owns(e)))
+                        })
+                        .cloned()
+                        .collect();
+                    let n = tasks.len().max(1) as f32;
                     let bw = ((avail - 4.0 * n) / n).clamp(40.0, 220.0);
-                    let tasks = self.tasks.clone();
                     for t in &tasks {
                         let active = t.hwnd == self.last_fg && !t.minimized;
                         let tex = self.tex_window(ctx, t.hwnd);
@@ -1113,6 +1178,9 @@ impl ShellApp {
                         }
                         if r.middle_clicked() {
                             actions.push(PanelAction::Close(t.hwnd));
+                        }
+                        if r.secondary_clicked() {
+                            actions.push(PanelAction::TaskMenu(t.hwnd, r.rect.left()));
                         }
                         if r.hovered() {
                             // A live preview instead of a text tooltip.
@@ -1294,11 +1362,13 @@ impl ShellApp {
                     self.last_fg = 0;
                 }
                 PanelAction::Close(h) => win::close(h),
-                PanelAction::FileManager => win::spawn_self(None),
-                PanelAction::Terminal => {
-                    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"));
-                    let _ = crate::platform::open_terminal(&home);
+                PanelAction::LaunchPin(i) => {
+                    if let Some(p) = self.pins.get(i).cloned() {
+                        self.launch_pin(&p);
+                    }
                 }
+                PanelAction::PinMenu(i, x, wins) => self.open_pin_menu(i, x, wins),
+                PanelAction::TaskMenu(h, x) => self.open_task_menu(h, x),
                 PanelAction::ToggleMedia => {
                     if self.media_open {
                         self.media_open = false;
@@ -1559,6 +1629,18 @@ impl ShellApp {
                                                     if resp.clicked() {
                                                         launch = Some((app.target.clone(), Some(app.name.clone())));
                                                     }
+                                                    if resp.secondary_clicked() {
+                                                        self.launcher_sel = k;
+                                                    }
+                                                    resp.context_menu(|ui| {
+                                                        for (label, cmd) in self.app_menu_items(&app.name, &app.target) {
+                                                            if ui.button(label).clicked() {
+                                                                self.menu_cmds.push(cmd);
+ui.ctx().request_repaint();
+                                                                ui.close_menu();
+                                                            }
+                                                        }
+                                                    });
                                                     let desc = if app.desc.is_empty() { app.folder.clone() } else { app.desc.clone() };
                                                     (app.name, desc)
                                                 }
@@ -1583,12 +1665,13 @@ impl ShellApp {
                         }
 
                         // ---- right: places and system shortcuts
-                        let links: [(Option<Tool>, &str); 7] = [
+                        let links: [(Option<Tool>, &str); 8] = [
                             (Some(Tool::Desktop), crate::i18n::tr("This PC")),
                             (None, crate::i18n::tr("Documents")),
                             (None, crate::i18n::tr("Downloads")),
                             (Some(Tool::Gear), crate::i18n::tr("Settings")),
                             (Some(Tool::Details), crate::i18n::tr("Task Manager")),
+                            (Some(Tool::Chip), crate::i18n::tr("Device Manager")),
                             (Some(Tool::Terminal), crate::i18n::tr("Run…")),
                             (None, "Delfin"),
                         ];
@@ -1605,7 +1688,7 @@ impl ShellApp {
                             let ir = Rect::from_center_size(pos2(r.left() + 20.0, r.center().y), vec2(18.0, 18.0));
                             match tool {
                                 Some(t) => icons::paint_tool(ui.painter(), ir, *t, pal.text),
-                                None if k == 6 => paint_logo(ui.painter(), ir.center(), 9.0, pal),
+                                None if k == 7 => paint_logo(ui.painter(), ir.center(), 9.0, pal),
                                 None => icons::paint_folder(ui.painter(), ir, icons::FOLDER),
                             }
                             ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, *label, FontId::proportional(13.5), pal.text);
@@ -1624,7 +1707,8 @@ impl ShellApp {
                                     }
                                     3 => launch = Some((Launch::Cmd("ms-settings:".into()), None)),
                                     4 => launch = Some((Launch::Cmd("taskmgr.exe".into()), None)),
-                                    5 => {
+                                    5 => launch = Some((Launch::Cmd("devmgmt.msc".into()), None)),
+                                    6 => {
                                         // Run: the search box doubles as the Run box.
                                         self.launcher_cat = None;
                                         self.launcher_focus_pending = true;
@@ -2186,9 +2270,28 @@ impl ShellApp {
                                     actions.push(DeskAction::Terminal(it.path.clone()));
                                     ui.close_menu();
                                 }
+                                // Programs and shortcuts: pin to the panel.
+                                let ext = it.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                                if !it.is_dir && ["exe", "lnk", "url", "appref-ms"].contains(&ext.as_str()) {
+                                    let name = it.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                                    let target = Launch::Path(it.path.clone());
+                                    let pinned = self.pins.iter().any(|p| p.same_target(&target));
+                                    let label = if pinned { crate::i18n::tr("Unpin from taskbar") } else { crate::i18n::tr("Pin to taskbar") };
+                                    if ui.button(label).clicked() {
+                                        self.menu_cmds.push(if pinned { MenuCmd::Unpin(target) } else { MenuCmd::Pin(pins::Pin::new(name, target)) });
+ui.ctx().request_repaint();
+                                        ui.close_menu();
+                                    }
+                                }
                                 ui.separator();
                                 if ui.button(crate::i18n::tr("Move to Trash")).clicked() {
                                     actions.push(DeskAction::Trash(it.path.clone()));
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui.button(crate::i18n::tr("Properties")).clicked() {
+                                    self.menu_cmds.push(MenuCmd::Props(it.path.clone()));
+ui.ctx().request_repaint();
                                     ui.close_menu();
                                 }
                             });
@@ -2309,6 +2412,12 @@ impl eframe::App for ShellApp {
         if self.media_open {
             self.media_viewport(ctx, &pal);
         }
+        if self.panel_menu.is_some() {
+            self.panel_menu_viewport(ctx, &pal);
+        }
+        for c in std::mem::take(&mut self.menu_cmds) {
+            self.run_menu_cmd(c);
+        }
         if self.preview.is_some() {
             self.preview_viewport(ctx, &pal);
         }
@@ -2356,15 +2465,6 @@ fn launcher_button(ui: &mut Ui, open: bool, pal: &Palette) -> egui::Response {
         p.circle_filled(c + vec2(a.cos(), a.sin()) * 5.5, 2.4, Color32::WHITE);
     }
     p.circle_stroke(c, 5.5, Stroke::new(1.2_f32, Color32::WHITE));
-    resp
-}
-
-fn pinned_folder(ui: &mut Ui, pal: &Palette) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, pal.hover);
-    }
-    icons::paint_folder(ui.painter(), rect.shrink(8.0), icons::FOLDER);
     resp
 }
 
@@ -3332,5 +3432,264 @@ impl ShellApp {
                     );
                 });
         });
+    }
+}
+
+/// `devmgmt.msc`, `mmc devmgmt.msc`, `hdwwiz.cpl`: Windows' Device Manager.
+fn is_devmgr_cmd(c: &str) -> bool {
+    let l = c.trim().trim_matches('"').to_lowercase();
+    l == "devmgmt.msc" || l == "devmgmt" || l.ends_with(" devmgmt.msc") || l == "hdwwiz.cpl" || l == "control hdwwiz.cpl"
+}
+
+// ----------------------------------------------------------------- pinned apps & menus
+
+/// Something picked in a right-click menu.
+#[derive(Clone)]
+enum MenuCmd {
+    Launch(Launch),
+    Pin(pins::Pin),
+    Unpin(Launch),
+    /// Delfin's Properties window for a file.
+    Props(PathBuf),
+    /// The folder that holds a file, in Delfin.
+    Location(PathBuf),
+    CloseWindows(Vec<isize>),
+}
+
+struct PanelMenu {
+    /// Left edge of the button it belongs to (points from the screen's left).
+    x: f32,
+    title: String,
+    items: Vec<(String, MenuCmd)>,
+    seen_focus: bool,
+}
+
+const MENU_W: f32 = 250.0;
+const MENU_ROW: f32 = 32.0;
+
+/// A path you can open Properties for (not `shell:AppsFolder\…`).
+fn real_file(l: &Launch) -> Option<PathBuf> {
+    match l {
+        Launch::Path(p) if p.is_file() => Some(p.clone()),
+        _ => None,
+    }
+}
+
+fn spawn_props(path: &Path) {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).arg("--props").arg(path).spawn();
+    }
+}
+
+impl ShellApp {
+    fn launch_pin(&mut self, pin: &pins::Pin) {
+        match &pin.target {
+            // The terminal falls back to PowerShell without Windows Terminal.
+            Launch::Cmd(c) if c.eq_ignore_ascii_case("wt.exe") => {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"));
+                let _ = crate::platform::open_terminal(&home);
+            }
+            t => self.launch(t),
+        }
+    }
+
+    /// Menu entries for an app in the launcher or on the desktop.
+    fn app_menu_items(&self, name: &str, target: &Launch) -> Vec<(String, MenuCmd)> {
+        let mut v = Vec::new();
+        if self.pins.iter().any(|p| p.same_target(target)) {
+            v.push((crate::i18n::tr("Unpin from taskbar").to_string(), MenuCmd::Unpin(target.clone())));
+        } else {
+            v.push((crate::i18n::tr("Pin to taskbar").to_string(), MenuCmd::Pin(pins::Pin::new(name.to_string(), target.clone()))));
+        }
+        if let Some(f) = real_file(target) {
+            v.push((crate::i18n::tr("Open file location").to_string(), MenuCmd::Location(f.clone())));
+            v.push((crate::i18n::tr("Properties").to_string(), MenuCmd::Props(f)));
+        }
+        v
+    }
+
+    fn open_pin_menu(&mut self, i: usize, x: f32, wins: Vec<isize>) {
+        let Some(pin) = self.pins.get(i).cloned() else { return };
+        let mut items = vec![(
+            if wins.is_empty() { crate::i18n::tr("Open").to_string() } else { crate::i18n::tr("New window").to_string() },
+            MenuCmd::Launch(pin.target.clone()),
+        )];
+        items.push((crate::i18n::tr("Unpin from taskbar").to_string(), MenuCmd::Unpin(pin.target.clone())));
+        if let Some(f) = real_file(&pin.target) {
+            items.push((crate::i18n::tr("Open file location").to_string(), MenuCmd::Location(f.clone())));
+            items.push((crate::i18n::tr("Properties").to_string(), MenuCmd::Props(f)));
+        }
+        if !wins.is_empty() {
+            let label = if wins.len() == 1 { crate::i18n::tr("Close window").to_string() } else { crate::i18n::tr("Close all windows").to_string() };
+            items.push((label, MenuCmd::CloseWindows(wins)));
+        }
+        self.show_panel_menu(x, pin.name, items);
+    }
+
+    fn open_task_menu(&mut self, h: isize, x: f32) {
+        let title = self.tasks.iter().find(|t| t.hwnd == h).map(|t| t.title.clone()).unwrap_or_default();
+        let mut items = Vec::new();
+        let exe = win::window_exe(h);
+        // Store apps run inside ApplicationFrameHost: nothing to pin there.
+        if let Some(exe) = exe.filter(|e| {
+            let n = e.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            n != "applicationframehost.exe" && n != "explorer.exe"
+        }) {
+            let name = startmenu::file_description(&exe)
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or_else(|| exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+            items.push((crate::i18n::tr("Pin to taskbar").to_string(), MenuCmd::Pin(pins::Pin::new(name, Launch::Path(exe.clone())))));
+            items.push((crate::i18n::tr("Open file location").to_string(), MenuCmd::Location(exe.clone())));
+            items.push((crate::i18n::tr("Properties").to_string(), MenuCmd::Props(exe)));
+        }
+        items.push((crate::i18n::tr("Close window").to_string(), MenuCmd::CloseWindows(vec![h])));
+        self.show_panel_menu(x, title, items);
+    }
+
+    fn show_panel_menu(&mut self, x: f32, title: String, items: Vec<(String, MenuCmd)>) {
+        self.open_quick(None);
+        self.open_launcher(false);
+        self.calendar_open = false;
+        self.preview = None;
+        self.panel_menu = Some(PanelMenu { x, title, items, seen_focus: false });
+    }
+
+    fn run_menu_cmd(&mut self, c: MenuCmd) {
+        match c {
+            MenuCmd::Launch(l) => match self.pins.iter().find(|p| p.same_target(&l)).cloned() {
+                Some(p) => self.launch_pin(&p),
+                None => self.launch(&l),
+            },
+            MenuCmd::Pin(p) => {
+                if !self.pins.iter().any(|x| x.same_target(&p.target)) {
+                    self.pins.push(p);
+                    pins::save(&self.pins);
+                    self.pins_mtime = pins::modified();
+                }
+            }
+            MenuCmd::Unpin(t) => {
+                self.pins.retain(|p| !p.same_target(&t));
+                pins::save(&self.pins);
+                self.pins_mtime = pins::modified();
+            }
+            MenuCmd::Props(p) => spawn_props(&p),
+            MenuCmd::Location(p) => win::spawn_self(p.parent()),
+            MenuCmd::CloseWindows(ws) => {
+                for h in ws {
+                    win::close(h);
+                }
+            }
+        }
+    }
+
+    /// A pinned app on the panel. `state`: 0 not running, 1 running, 2 in front.
+    fn pin_button(&mut self, ui: &mut Ui, ctx: &egui::Context, pin: &pins::Pin, state: u8, pal: &Palette) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 36.0), Sense::click());
+        let p = ui.painter().clone();
+        if state == 2 {
+            p.rect_filled(rect, 4.0, pal.select);
+        } else if resp.hovered() {
+            p.rect_filled(rect, 4.0, pal.hover);
+        }
+        if state > 0 {
+            let w = if state == 2 { 16.0 } else { 6.0 };
+            p.line_segment(
+                [pos2(rect.center().x - w / 2.0, rect.bottom() - 1.0), pos2(rect.center().x + w / 2.0, rect.bottom() - 1.0)],
+                Stroke::new(2.5_f32, if state == 2 { pal.accent } else { pal.dim }),
+            );
+        }
+        let ir = Rect::from_center_size(rect.center(), vec2(22.0, 22.0));
+        match &pin.target {
+            Launch::Cmd(c) if c == "delfin" => icons::paint_folder(&p, rect.shrink(8.0), icons::FOLDER),
+            Launch::Cmd(c) => {
+                let tool = if c.eq_ignore_ascii_case("wt.exe") {
+                    Some(Tool::Terminal)
+                } else {
+                    self.apps.iter().find(|a| matches!(&a.target, Launch::Cmd(x) if x.eq_ignore_ascii_case(c))).and_then(|a| a.icon)
+                };
+                icons::paint_tool(&p, ir.shrink(2.0), tool.unwrap_or(Tool::Desktop), pal.text);
+            }
+            Launch::Path(path) => match self.tex_file(ctx, path, false) {
+                Some(t) => {
+                    p.image(t.id(), ir, uv_full(), Color32::WHITE);
+                }
+                None => icons::paint_tool(&p, ir.shrink(2.0), Tool::Desktop, pal.dim),
+            },
+        }
+        resp
+    }
+
+    fn panel_menu_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(menu) = &self.panel_menu else { return };
+        let h = 44.0 + menu.items.len() as f32 * MENU_ROW + 12.0;
+        let screen = Self::screen_points(ctx);
+        let x = menu.x.clamp(4.0, (screen.x - MENU_W - 4.0).max(4.0));
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Menu")
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([MENU_W, h])
+            .with_position([x, screen.y - self.lift - PANEL_H - h - 6.0]);
+        let mut picked: Option<MenuCmd> = None;
+        let mut close = false;
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_panel_menu"), builder, |ctx, _| {
+            if !win::reveal_popup("Delfin Menu", true) {
+                ctx.request_repaint();
+            }
+            let Some(menu) = &mut self.panel_menu else { return };
+            let focused = ctx.input(|i| i.viewport().focused);
+            if focused == Some(true) {
+                menu.seen_focus = true;
+            }
+            if menu.seen_focus && focused == Some(false) {
+                close = true;
+            }
+            if !menu.seen_focus {
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested()) {
+                close = true;
+            }
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window).stroke(Stroke::new(1.0_f32, pal.border)).inner_margin(Margin::same(6.0)))
+                .show(ctx, |ui| {
+                    let (tr_, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
+                    ui.painter().with_clip_rect(tr_).text(
+                        pos2(tr_.left() + 10.0, tr_.center().y),
+                        Align2::LEFT_CENTER,
+                        &menu.title,
+                        FontId::proportional(12.5),
+                        pal.dim,
+                    );
+                    ui.painter().line_segment([pos2(tr_.left(), tr_.bottom()), pos2(tr_.right(), tr_.bottom())], Stroke::new(1.0_f32, pal.border));
+                    ui.add_space(4.0);
+                    for (label, cmd) in &menu.items {
+                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), MENU_ROW), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(r, 4.0, pal.hover);
+                        }
+                        let danger = matches!(cmd, MenuCmd::CloseWindows(_));
+                        ui.painter().text(
+                            pos2(r.left() + 10.0, r.center().y),
+                            Align2::LEFT_CENTER,
+                            label,
+                            FontId::proportional(13.5),
+                            if danger { pal.danger } else { pal.text },
+                        );
+                        if resp.clicked() {
+                            picked = Some(cmd.clone());
+                        }
+                    }
+                });
+        });
+        if let Some(c) = picked {
+            self.panel_menu = None;
+            self.run_menu_cmd(c);
+        } else if close {
+            self.panel_menu = None;
+        }
     }
 }

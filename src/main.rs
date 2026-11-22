@@ -4,11 +4,15 @@
 mod app;
 mod config;
 #[cfg(windows)]
+mod devmgr;
+#[cfg(windows)]
 mod display;
 mod fsops;
 mod i18n;
 mod fileicons;
 mod icons;
+#[cfg(windows)]
+mod props;
 mod platform;
 #[cfg(windows)]
 mod setup;
@@ -45,6 +49,17 @@ fn main() -> Result<(), eframe::Error> {
                 platform::message("Delfin", &e);
             }
             return Ok(());
+        }
+        if let Some(i) = args.iter().position(|a| a == "--props") {
+            if let Some(p) = args.get(i + 1) {
+                return props::run(std::path::PathBuf::from(p));
+            }
+        }
+        if has("--devmgr") {
+            return devmgr::run();
+        }
+        if let Some(i) = args.iter().position(|a| a == "--devmgr-do") {
+            std::process::exit(devmgr::run_action(&args[i + 1..]));
         }
         if has("--display") {
             return display::run();

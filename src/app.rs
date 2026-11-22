@@ -857,6 +857,15 @@ impl App {
         if ck(NONE, Key::Delete) {
             acts.push(Action::Trash);
         }
+        // Alt+Enter: Properties, like in Windows.
+        if ck(ALT, Key::Enter) {
+            #[cfg(windows)]
+            if let Some(p) = self.pane().selected_paths().into_iter().next() {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).arg("--props").arg(&p).spawn();
+                }
+            }
+        }
         if ck(NONE, Key::Enter) {
             acts.push(Action::OpenSelected);
         }
@@ -2016,8 +2025,33 @@ fn item_menu(ui: &mut Ui, path: &Path, is_dir: bool, out: &mut PaneOut) {
     if is_dir && mi(ui, crate::i18n::tr("Add to Places"), "") {
         out.actions.push(Action::AddPlace(path.to_path_buf()));
     }
-    if mi(ui, crate::i18n::tr("Properties"), "F11") {
+    #[cfg(windows)]
+    {
+        // Programs and shortcuts can go on the Delfin panel.
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if !is_dir && ["exe", "lnk", "url", "appref-ms"].contains(&ext.as_str()) {
+            use crate::shell::pins;
+            if pins::is_pinned(path) {
+                if mi(ui, crate::i18n::tr("Unpin from taskbar"), "") {
+                    pins::unpin_path(path);
+                    ui.close_menu();
+                }
+            } else if mi(ui, crate::i18n::tr("Pin to taskbar"), "") {
+                let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                pins::pin_path(&name, path);
+                ui.close_menu();
+            }
+        }
+    }
+    if mi(ui, crate::i18n::tr("Information Panel"), "F11") {
         out.actions.push(Action::ShowInfo);
+    }
+    #[cfg(windows)]
+    if mi(ui, crate::i18n::tr("Properties"), "Alt+Enter") {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).arg("--props").arg(path).spawn();
+        }
+        ui.close_menu();
     }
 }
 

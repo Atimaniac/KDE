@@ -134,3 +134,8 @@ pub fn paint(p: &Painter, rect: Rect, path: &Path, is_dir: bool, ext: &str, pal:
     }
 }
 
+
+/// A file's icon right away (no cache): tier 0 = 16 px, 1 = 32 px, 2 = 48 px.
+pub fn icon_pixels(path: &Path, tier: u8) -> Option<(usize, usize, Vec<u8>)> {
+    load(path, tier)
+}

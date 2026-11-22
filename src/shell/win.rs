@@ -900,3 +900,26 @@ pub fn app_command(cmd: u16) -> bool {
     hook_send(h);
     true
 }
+
+/// The program (.exe) that owns a window.
+pub fn window_exe(h: isize) -> Option<PathBuf> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h as HWND, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if p.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(p);
+        ok.then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+    }
+}
