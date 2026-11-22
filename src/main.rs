@@ -17,6 +17,8 @@ mod platform;
 #[cfg(windows)]
 mod setup;
 #[cfg(windows)]
+mod settings;
+#[cfg(windows)]
 mod shell;
 mod theme;
 #[cfg(windows)]
@@ -61,8 +63,11 @@ fn main() -> Result<(), eframe::Error> {
         if let Some(i) = args.iter().position(|a| a == "--devmgr-do") {
             std::process::exit(devmgr::run_action(&args[i + 1..]));
         }
+        if let Some(i) = args.iter().position(|a| a == "--settings") {
+            return settings::run(args.get(i + 1).filter(|a| !a.starts_with("--")).cloned());
+        }
         if has("--display") {
-            return display::run();
+            return settings::run(Some("display".into()));
         }
         if has("--uninstall") {
             return setup::run_uninstall();

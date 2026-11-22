@@ -2,7 +2,7 @@
 //! start-up apps, details and services. Can replace Windows Task Manager
 //! (every start of taskmgr.exe, also Ctrl+Shift+Esc and Ctrl+Alt+Del, opens it).
 
-mod sys;
+pub(crate) mod sys;
 
 use crate::i18n::{tr, trf};
 use crate::theme::{self, Palette};

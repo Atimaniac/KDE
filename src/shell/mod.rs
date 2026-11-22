@@ -10,7 +10,7 @@
 pub mod install;
 mod media;
 pub(crate) mod pins;
-mod quick;
+pub(crate) mod quick;
 mod startmenu;
 mod startup;
 mod tray;
@@ -494,15 +494,10 @@ impl ShellApp {
         resp
     }
 
-    /// Open a link from the shell. Without Explorer, Windows' Settings app can't
-    /// start: the main Settings page opens Delfin's settings, the other pages
-    /// their classic Control Panel dialog (see `win::classic_settings`).
+    /// Open a link from the shell. `ms-settings:` pages open Delfin's Settings
+    /// window (see `win::shell_open`).
     fn open_uri(&mut self, u: &str) {
-        if u == "ms-settings:" && !win::explorer_running() {
-            self.settings_open = true;
-        } else {
-            win::shell_open(u);
-        }
+        win::shell_open(u);
     }
 
     fn launch(&mut self, l: &Launch) {

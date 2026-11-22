@@ -13,7 +13,7 @@ chrono = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
-windows = { version = "0.62", features = ["Media_Control", "Storage_Streams", "Foundation"] }
+windows = { version = "0.62", features = ["Media_Control", "Storage_Streams", "Foundation", "Foundation_Collections", "Devices_Radios"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "webp"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

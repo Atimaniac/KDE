@@ -561,6 +561,13 @@ pub fn spawn_self(arg: Option<&Path>) {
 /// crate it never starts PowerShell or falls back to explorer.exe.
 pub fn shell_open(target: impl AsRef<std::ffi::OsStr>) {
     let t = target.as_ref().to_string_lossy().to_string();
+    // Settings: Delfin's own window for every page it has.
+    if t.starts_with("ms-settings:") && crate::settings::page_for(&t).is_some() {
+        if let Ok(me) = std::env::current_exe() {
+            let _ = Command::new(me).args(["--settings", &t]).spawn();
+            return;
+        }
+    }
     if t.starts_with("ms-settings:") && !explorer_running() {
         if let Some((exe, args)) = classic_settings(&t) {
             let _ = Command::new(exe).args(args).spawn();
@@ -591,16 +598,12 @@ pub fn explorer_running() -> bool {
     find_class("Shell_TrayWnd").is_some_and(|h| pid_of(h) != std::process::id())
 }
 
-/// Windows' Settings app can't start without Explorer. These pages have a
-/// classic counterpart that still works (or Delfin's own display window).
+/// Windows' Settings app can't start without Explorer. Pages Delfin's own
+/// Settings window doesn't have may still have a classic counterpart.
 pub fn classic_settings(uri: &str) -> Option<(String, Vec<String>)> {
     let page = uri.trim_start_matches("ms-settings:").to_lowercase();
     let cpl = |name: &str| Some(("rundll32.exe".to_string(), vec!["shell32.dll,Control_RunDLL".to_string(), name.to_string()]));
     match page.as_str() {
-        p if p.starts_with("display") || p.starts_with("personalization") => {
-            let me = std::env::current_exe().ok()?;
-            Some((me.to_string_lossy().to_string(), vec!["--display".to_string()]))
-        }
         p if p.starts_with("sound") => cpl("mmsys.cpl"),
         "apps-volume" => Some(("sndvol.exe".to_string(), Vec::new())),
         p if p.starts_with("network") => cpl("ncpa.cpl"),

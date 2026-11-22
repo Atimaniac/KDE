@@ -49,6 +49,11 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
 - **Properties** (`delfin.exe --props <file>`, right-click → *Properties*, Alt+Enter in the file manager):
   General, Shortcut (edit target, arguments, start in…), Compatibility (compatibility mode, run as
   administrator, high DPI…) and Details (version information, 32/64-bit).
+- **Settings** (`delfin.exe --settings [page]`, launcher → *Settings*, every `ms-settings:` link): Delfin's
+  take on Windows 11 Settings, which can't start without Explorer. System (display, sound, power plans and
+  sleep, storage and cleanup, about / rename PC), Bluetooth & devices, mouse, network & Wi-Fi,
+  personalization (wallpaper, dark mode), installed apps (uninstall), startup apps, accounts, time zone and
+  language, Windows Update (check, install, history) and Delfin's own options. Search with Ctrl+F.
 - **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher, `Alt+Tab` window
   switcher, `Ctrl+Shift+Esc` task manager.
 - Folders opened anywhere in Windows open in Delfin.

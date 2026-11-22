@@ -711,7 +711,7 @@ impl QuickPanel {
         }
     }
 
-    fn network_ui(&mut self, ui: &mut egui::Ui, pal: &Palette, action: &mut Option<QuickAction>) {
+    pub(crate) fn network_ui(&mut self, ui: &mut egui::Ui, pal: &Palette, action: &mut Option<QuickAction>) {
         // Wi-Fi
         let (present, radio_on, nets, status) = {
             let s = self.wifi.state.lock().unwrap();
@@ -815,7 +815,7 @@ impl QuickPanel {
 
 // ------------------------------------------------------------------ widgets & glyphs
 
-fn toggle(ui: &mut egui::Ui, on: &mut bool, pal: &Palette) -> egui::Response {
+pub(crate) fn toggle(ui: &mut egui::Ui, on: &mut bool, pal: &Palette) -> egui::Response {
     let (r, mut resp) = ui.allocate_exact_size(vec2(40.0, 20.0), Sense::click());
     if resp.clicked() {
         *on = !*on;

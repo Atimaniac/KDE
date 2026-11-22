@@ -3,7 +3,7 @@
 //! hardware changes. Reads SetupAPI directly, so it opens instantly (Windows'
 //! own one is an MMC console that takes its time).
 
-mod sys;
+pub(crate) mod sys;
 
 use crate::i18n::{tr, trf};
 use crate::icons::{self, Tool};

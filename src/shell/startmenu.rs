@@ -68,7 +68,7 @@ fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<AppEntry>) {
 pub fn scan() -> Vec<AppEntry> {
     let mut out = vec![
         builtin("Delfin", "delfin", Tool::Home, crate::i18n::tr("File manager")),
-        builtin(crate::i18n::tr("Settings"), "ms-settings:", Tool::Gear, crate::i18n::tr("Windows settings")),
+        builtin(crate::i18n::tr("Settings"), "ms-settings:", Tool::Gear, crate::i18n::tr("System, devices, network, apps, updates")),
         builtin(crate::i18n::tr("Terminal"), "wt.exe", Tool::Terminal, crate::i18n::tr("Command line")),
         builtin(crate::i18n::tr("Task Manager"), "taskmgr.exe", Tool::Details, crate::i18n::tr("Running programs")),
         builtin(crate::i18n::tr("Device Manager"), "devmgmt.msc", Tool::Chip, crate::i18n::tr("Hardware and drivers")),
