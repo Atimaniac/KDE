@@ -272,6 +272,26 @@ fn goto_file() -> PathBuf {
     std::env::temp_dir().join("delfin-settings.goto")
 }
 
+/// Signalled by a second start after it wrote the page it wants.
+const GOTO_EVENT: &str = "Local\\DelfinSettingsGoto";
+static GOTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Wait (without polling) for a second start asking for a page.
+fn spawn_goto_waiter(ctx: egui::Context) {
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+        let name = sys::wide(GOTO_EVENT);
+        let ev = CreateEventW(std::ptr::null(), 0, 0, name.as_ptr());
+        if ev.is_null() {
+            return;
+        }
+        while WaitForSingleObject(ev, INFINITE) == 0 {
+            GOTO.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.request_repaint();
+        }
+    });
+}
+
 pub fn run(page: Option<String>) -> Result<(), eframe::Error> {
     let start = page.as_deref().and_then(page_for).unwrap_or(Page::System);
     // One window: a second start shows the open one at the asked page.
@@ -281,6 +301,15 @@ pub fn run(page: Option<String>) -> Result<(), eframe::Error> {
         let h = windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, m.as_ptr());
         if !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = std::fs::write(goto_file(), start.name());
+            {
+                use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent};
+                let name = sys::wide(GOTO_EVENT);
+                let ev = OpenEventW(0x0002 /* EVENT_MODIFY_STATE */, 0, name.as_ptr());
+                if !ev.is_null() {
+                    SetEvent(ev);
+                    windows_sys::Win32::Foundation::CloseHandle(ev);
+                }
+            }
             if let Some(w) = std::fs::read_to_string(hwnd_file()).ok().and_then(|s| s.trim().parse::<isize>().ok()) {
                 use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow, SetForegroundWindow, ShowWindow};
                 let w = w as windows_sys::Win32::Foundation::HWND;
@@ -352,14 +381,15 @@ struct Settings {
     back: Vec<Page>,
     query: String,
     hwnd: isize,
-    last_goto_check: Instant,
 
     about: Slot<sys::About>,
     about_v: Option<sys::About>,
     account: Slot<sys::Account>,
     account_v: Option<sys::Account>,
     avatar: Option<TextureHandle>,
-    quick: QuickPanel,
+    /// Volume, brightness and Wi-Fi: started the first time a page needs them.
+    quick: Option<QuickPanel>,
+    ctx: egui::Context,
     display: Option<DisplayState>,
     plans: Option<Vec<sys::Plan>>,
     timeouts: [u32; 4],
@@ -399,6 +429,18 @@ struct Settings {
     toast: Option<(String, Instant, bool)>,
     /// Background jobs that changed something: reload this page.
     reload: Arc<Mutex<HashSet<Page>>>,
+    /// Values read when a page opens (not on every frame).
+    cached: Cached,
+}
+
+#[derive(Default)]
+struct Cached {
+    auto_time: bool,
+    time_server: String,
+    fit: usize,
+    transparency: bool,
+    tm_replaced: bool,
+    battery: Option<(u8, bool)>,
 }
 
 impl Settings {
@@ -410,13 +452,13 @@ impl Settings {
             back: Vec::new(),
             query: String::new(),
             hwnd: 0,
-            last_goto_check: Instant::now(),
             about: spawn(ctx, sys::about),
             about_v: None,
             account: spawn(ctx, sys::account),
             account_v: None,
             avatar: None,
-            quick: QuickPanel::new(ctx),
+            quick: None,
+            ctx: ctx.clone(),
             display: None,
             plans: None,
             timeouts: [0; 4],
@@ -455,10 +497,18 @@ impl Settings {
             toasts: Arc::new(Mutex::new(Vec::new())),
             toast: None,
             reload: Arc::new(Mutex::new(HashSet::new())),
+            cached: Cached::default(),
         };
+        spawn_goto_waiter(ctx.clone());
         s.load_wallpaper(ctx);
         s.enter(ctx, page);
         s
+    }
+
+    /// Volume, brightness and Wi-Fi, started on first use.
+    fn qp(&mut self) -> &mut QuickPanel {
+        let ctx = self.ctx.clone();
+        self.quick.get_or_insert_with(|| QuickPanel::new(&ctx))
     }
 
     fn look(&self) -> Look {
@@ -504,7 +554,9 @@ impl Settings {
     /// Load what a page shows when it is opened.
     fn enter(&mut self, ctx: &egui::Context, page: Page) {
         if self.page == Page::Network && page != Page::Network {
-            self.quick.wifi.set_active(false);
+            if let Some(q) = &self.quick {
+                q.wifi.set_active(false);
+            }
         }
         self.page = page;
         self.rename = None;
@@ -513,9 +565,11 @@ impl Settings {
                 let monitors = crate::display::monitors();
                 let sel = monitors.iter().position(|m| m.primary).unwrap_or(0);
                 self.display = Some(DisplayState { monitors, sel, pending: None });
+                self.qp();
             }
-            Page::Sound => self.quick.refresh_volume(),
+            Page::Sound => self.qp().refresh_volume(),
             Page::Power => {
+                self.cached.battery = quick::battery();
                 self.plans = Some(sys::plans());
                 self.timeouts = sys::timeouts();
             }
@@ -531,11 +585,13 @@ impl Settings {
             }
             Page::Mouse => self.mouse = Some(sys::mouse()),
             Page::Network => {
-                self.quick.wifi.set_active(true);
+                self.qp().wifi.set_active(true);
                 self.adapters = spawn(ctx, sys::adapters);
                 self.adapters_at = Some(Instant::now());
             }
             Page::Personalization => {
+                self.cached.fit = sys::wallpaper_fit();
+                self.cached.transparency = sys::transparency();
                 self.wallpaper = sys::wallpaper();
                 self.load_wallpaper(ctx);
                 if self.gallery_tex.is_none() {
@@ -559,7 +615,10 @@ impl Settings {
                     self.zones = Some(sys::time_zones());
                 }
                 self.zone = sys::current_time_zone();
+                self.cached.auto_time = sys::auto_time();
+                self.cached.time_server = sys::time_server();
             }
+            Page::Delfin => self.cached.tm_replaced = crate::taskmgr::replaced(),
             Page::Update => {
                 let fresh = self.wu.lock().unwrap_or_else(|p| p.into_inner()).checked.is_none();
                 if fresh {
@@ -723,8 +782,7 @@ impl Settings {
             self.adapters_at = Some(Instant::now());
         }
         // Another start asked for a page.
-        if self.last_goto_check.elapsed() > Duration::from_millis(400) {
-            self.last_goto_check = Instant::now();
+        if GOTO.swap(false, std::sync::atomic::Ordering::Relaxed) {
             if let Ok(name) = std::fs::read_to_string(goto_file()) {
                 let _ = std::fs::remove_file(goto_file());
                 if let Some(p) = page_for(&name) {
@@ -803,7 +861,28 @@ fn round_mask(w: usize, h: usize, px: &[u8]) -> Vec<u8> {
 impl eframe::App for Settings {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // Redraw on input and when background work finishes; timers only for
+        // what changes by itself.
+        let mut wake: Option<Duration> = None;
+        let mut soon = |d: Duration| wake = Some(wake.map_or(d, |w| w.min(d)));
+        if self.page == Page::Network {
+            soon(Duration::from_secs(5)); // adapter details
+        }
+        if self.page == Page::Time {
+            soon(Duration::from_millis(1000 - chrono::Local::now().timestamp_subsec_millis().min(999) as u64 + 10));
+        }
+        if self.display.as_ref().is_some_and(|d| d.pending.is_some()) {
+            soon(Duration::from_millis(250)); // "keep changes" countdown
+        }
+        if let Some((_, t)) = &self.armed {
+            soon(Duration::from_secs(5).saturating_sub(t.elapsed()) + Duration::from_millis(20));
+        }
+        if let Some((_, t, _)) = &self.toast {
+            soon(Duration::from_secs(6).saturating_sub(t.elapsed()) + Duration::from_millis(20));
+        }
+        if let Some(d) = wake {
+            ctx.request_repaint_after(d);
+        }
         let lk = self.look();
         let pal = self.pal;
 
@@ -1494,7 +1573,7 @@ impl Settings {
         use crate::display::{apply, monitors, orient_label, Mode};
         let pal = lk.pal;
         // Brightness
-        let bright = *self.quick.bright.value.lock().unwrap();
+        let bright = *self.qp().bright.value.lock().unwrap();
         if let Some(mut b) = bright {
             let mut changed = false;
             row_with(ui, lk, Some(Ico::Contrast), tr("Brightness"), tr("Adjust the brightness of your screen"), false, 300.0, |ui| {
@@ -1503,7 +1582,7 @@ impl Settings {
                 changed = ui.add(egui::Slider::new(&mut b, 0..=100).show_value(false)).changed();
             });
             if changed {
-                self.quick.bright.set(b);
+                self.qp().bright.set(b);
             }
         }
 
@@ -1639,7 +1718,7 @@ impl Settings {
     fn sound_page(&mut self, ui: &mut Ui, lk: Look) {
         let pal = lk.pal;
         section(ui, tr("Output"));
-        match self.quick.volume_state() {
+        match self.qp().volume_state() {
             Some((level, muted)) => {
                 let mut v = (level * 100.0).round() as u32;
                 let mut changed = false;
@@ -1656,10 +1735,10 @@ impl Settings {
                     mute = resp.on_hover_text(if muted { tr("Unmute") } else { tr("Mute") }).clicked();
                 });
                 if changed {
-                    self.quick.set_volume(v as f32 / 100.0);
+                    self.qp().set_volume(v as f32 / 100.0);
                 }
                 if mute {
-                    self.quick.toggle_mute();
+                    self.qp().toggle_mute();
                 }
             }
             None => {
@@ -1686,7 +1765,7 @@ impl Settings {
 
     fn power_page(&mut self, ui: &mut Ui, lk: Look) {
         let pal = lk.pal;
-        let battery = quick::battery();
+        let battery = self.cached.battery;
         if let Some((pct, charging)) = battery {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(60.0, 40.0), Sense::hover());
@@ -2097,7 +2176,7 @@ impl Settings {
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(64.0, 56.0), Sense::hover());
             match up {
-                Some(a) if a.wifi => quick::paint_wifi(ui.painter(), r.shrink(8.0), pal.text, pal.border, self.quick.wifi_signal().or(Some(100))),
+                Some(a) if a.wifi => quick::paint_wifi(ui.painter(), r.shrink(8.0), pal.text, pal.border, self.qp().wifi_signal().or(Some(100))),
                 Some(_) => paint_ico(ui.painter(), r.shrink(10.0), Ico::Ethernet, pal.text, &pal),
                 None => paint_ico(ui.painter(), r.shrink(10.0), Ico::Globe, pal.dim, &pal),
             }
@@ -2105,7 +2184,7 @@ impl Settings {
                 ui.add_space(6.0);
                 match up {
                     Some(a) => {
-                        let name = if a.wifi { self.quick.connected_ssid().unwrap_or_else(|| a.name.clone()) } else { a.name.clone() };
+                        let name = if a.wifi { self.qp().connected_ssid().unwrap_or_else(|| a.name.clone()) } else { a.name.clone() };
                         ui.label(RichText::new(name).size(20.0).strong());
                         ui.label(RichText::new(if a.gateway.is_empty() { tr("Connected, no internet") } else { tr("Connected") }).color(pal.dim));
                     }
@@ -2118,13 +2197,13 @@ impl Settings {
         });
 
         // Wi-Fi (the same list as the panel's quick settings)
-        let has_wifi = self.quick.wifi.state.lock().unwrap().present;
+        let has_wifi = self.qp().wifi.state.lock().unwrap().present;
         if has_wifi {
             section(ui, "Wi-Fi");
             let mut action = None;
             card(ui, lk, |ui| {
                 ui.set_max_width(ui.available_width().min(640.0));
-                self.quick.network_ui(ui, &pal, &mut action);
+                self.qp().network_ui(ui, &pal, &mut action);
             });
             if let Some(quick::QuickAction::Open(uri)) = action {
                 if let Some(p) = page_for(uri) {
@@ -2223,7 +2302,7 @@ impl Settings {
                 }
             }
         }
-        let mut fit = sys::wallpaper_fit();
+        let mut fit = self.cached.fit;
         let fits: Vec<(usize, String)> = sys::FITS.iter().enumerate().map(|(i, f)| (i, tr(f.0).to_string())).collect();
         let mut changed = false;
         row_with(ui, lk, Some(Ico::Monitor), tr("Choose a fit for your desktop image"), "", false, 200.0, |ui| {
@@ -2231,6 +2310,7 @@ impl Settings {
         });
         if changed {
             sys::set_wallpaper_fit(fit);
+            self.cached.fit = fit;
         }
         if let Some(gal) = &self.gallery_tex {
             let mut pick = None;
@@ -2280,13 +2360,14 @@ impl Settings {
             self.set_dark(ctx, mode == 1);
             self.say(tr("Open Delfin windows switch after they are reopened."), false);
         }
-        let mut tr_on = sys::transparency();
+        let mut tr_on = self.cached.transparency;
         let mut changed = false;
         row_with(ui, lk, Some(Ico::Brush), tr("Transparency effects"), tr("Windows and surfaces appear translucent"), false, 160.0, |ui| {
             changed = switch(ui, &pal, &mut tr_on);
         });
         if changed {
             sys::set_transparency(tr_on);
+            self.cached.transparency = tr_on;
         }
 
         section(ui, tr("Related settings"));
@@ -2494,11 +2575,10 @@ impl Settings {
             );
             ui.label(RichText::new(text).color(pal.dim));
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
 
         section(ui, tr("Date & time"));
-        let auto = sys::auto_time();
-        let server = sys::time_server();
+        let auto = self.cached.auto_time;
+        let server = self.cached.time_server.clone();
         let mut sync = false;
         row_with(
             ui,
@@ -2735,7 +2815,7 @@ impl Settings {
         }
 
         section(ui, tr("Shell"));
-        let mut replaced = crate::taskmgr::replaced();
+        let mut replaced = self.cached.tm_replaced;
         let mut changed = false;
         row_with(ui, lk, Some(Ico::Sliders), tr("Replace Windows Task Manager"), tr("Ctrl+Shift+Esc opens Delfin's Task Manager (asks for administrator rights)"), false, 160.0, |ui| {
             changed = switch(ui, &pal, &mut replaced);
@@ -2744,6 +2824,7 @@ impl Settings {
             if let Err(e) = crate::taskmgr::replace(replaced) {
                 self.say(e, true);
             }
+            self.cached.tm_replaced = crate::taskmgr::replaced();
         }
         if ext_row(ui, lk, Ico::Folder, tr("Delfin's settings folder"), "") {
             if let Some(d) = dirs::config_dir() {

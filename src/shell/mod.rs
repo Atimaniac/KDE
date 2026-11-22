@@ -148,6 +148,10 @@ struct ShellApp {
     wallpaper: Option<TextureHandle>,
     wallpaper_path: Option<PathBuf>,
     wallpaper_checked: Option<Instant>,
+    /// A wallpaper being decoded in the background.
+    wallpaper_job: Option<std::sync::mpsc::Receiver<Option<(usize, usize, Vec<u8>)>>>,
+    /// When the desktop folders last changed (only then is the list read again).
+    desktop_mtime: Vec<Option<std::time::SystemTime>>,
     shell_window_set: bool,
     // tray
     tray: Option<tray::Shared>,
@@ -185,6 +189,8 @@ struct ShellApp {
     preview_last_hover: Instant,
     /// Volume pop-up after a volume key: when it was last shown.
     osd: Option<Instant>,
+    /// The volume pop-up window is hidden (so it isn't hidden again every frame).
+    osd_hidden: bool,
     // what is playing (browser, Spotify, …) and its flyout
     media: media::Media,
     media_open: bool,
@@ -242,6 +248,7 @@ impl ShellApp {
 
         let (tx, rx) = channel();
         win::spawn_hotkeys(tx, cc.egui_ctx.clone());
+        win::spawn_window_events(cc.egui_ctx.clone());
         restore_leftover_shelved();
 
         // Tray host must exist before startup apps run, otherwise they decide
@@ -301,6 +308,8 @@ impl ShellApp {
             wallpaper: None,
             wallpaper_path: None,
             wallpaper_checked: None,
+            wallpaper_job: None,
+            desktop_mtime: Vec::new(),
             shell_window_set: false,
             tray,
             tray_tex: HashMap::new(),
@@ -329,6 +338,7 @@ impl ShellApp {
             preview: None,
             preview_last_hover: long_ago,
             osd: None,
+            osd_hidden: false,
             media: media::Media::start(cc.egui_ctx.clone()),
             media_open: false,
             media_seen_focus: false,
@@ -971,7 +981,9 @@ impl ShellApp {
         if fg != 0 && win::pid_of(fg) != self.own_pid {
             self.last_fg = fg;
         }
-        if self.last_poll.elapsed() < Duration::from_millis(400) {
+        // A window changed (see `win::spawn_window_events`), or the slow safety net.
+        let dirty = win::WINDOWS_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !dirty && self.last_poll.elapsed() < Duration::from_secs(5) {
             return;
         }
         self.last_poll = Instant::now();
@@ -1043,6 +1055,9 @@ impl ShellApp {
         if m != self.pins_mtime {
             self.pins_mtime = m;
             self.pins = pins::load();
+        }
+        if let Ok(mut w) = win::PANEL_WINDOWS.lock() {
+            *w = merged.iter().map(|t| t.hwnd).chain(self.shelved.iter().copied()).collect();
         }
         self.tasks = merged;
     }
@@ -2048,8 +2063,17 @@ ui.ctx().request_repaint();
             dirs_.push(d);
         }
         if let Ok(p) = std::env::var("PUBLIC") {
-            dirs_.push(PathBuf::from(p).join(crate::i18n::tr("Desktop")));
+            // The folder is "Desktop" on disk in every language.
+            dirs_.push(PathBuf::from(p).join("Desktop"));
         }
+        self.desktop_loaded = Instant::now();
+        // Read the folders again only when something in them changed.
+        let mtimes: Vec<Option<std::time::SystemTime>> =
+            dirs_.iter().map(|d| std::fs::metadata(d).and_then(|m| m.modified()).ok()).collect();
+        if mtimes == self.desktop_mtime && !self.desktop.is_empty() {
+            return;
+        }
+        self.desktop_mtime = mtimes;
         let mut items = Vec::new();
         for d in dirs_ {
             let Ok(list) = fsops::list_dir(&d) else {
@@ -2081,10 +2105,23 @@ ui.ctx().request_repaint();
                 .then_with(|| natural_cmp(&a.name, &b.name))
         });
         self.desktop = items;
-        self.desktop_loaded = Instant::now();
     }
 
+    /// Pick up a new wallpaper. The picture is decoded and scaled to the
+    /// screen on another thread, so the desktop never stalls on it.
     fn refresh_wallpaper(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.wallpaper_job {
+            match rx.try_recv() {
+                Ok(img) => {
+                    self.wallpaper_job = None;
+                    self.wallpaper = img.map(|(w, h, px)| {
+                        ctx.load_texture("wallpaper", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)
+                    });
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(_) => self.wallpaper_job = None,
+            }
+        }
         if self
             .wallpaper_checked
             .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
@@ -2092,30 +2129,41 @@ ui.ctx().request_repaint();
             return;
         }
         self.wallpaper_checked = Some(Instant::now());
-        let path = win::wallpaper_path();
-        if path == self.wallpaper_path && (self.wallpaper.is_some() || path.is_none()) {
+        // The same path can hold a new picture (slide shows), so the file's
+        // time is part of the key.
+        let path = win::wallpaper_path().map(|p| {
+            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+            let secs = t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            PathBuf::from(format!("{}|{secs}", p.display()))
+        });
+        if path == self.wallpaper_path {
             return;
         }
         self.wallpaper_path = path.clone();
-        self.wallpaper = path.and_then(|p| {
-            let bytes = std::fs::read(&p).ok()?;
-            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-            let img = if img.width() > 4096 || img.height() > 4096 {
-                image::imageops::resize(
-                    &img,
-                    img.width() / 2,
-                    img.height() / 2,
-                    image::imageops::FilterType::Triangle,
-                )
-            } else {
-                img
-            };
-            let size = [img.width() as usize, img.height() as usize];
-            Some(ctx.load_texture(
-                "wallpaper",
-                egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
-                egui::TextureOptions::LINEAR,
-            ))
+        let Some(key) = path else {
+            self.wallpaper = None;
+            return;
+        };
+        let file = PathBuf::from(key.to_string_lossy().rsplit_once('|').map(|(p, _)| p.to_string()).unwrap_or_default());
+        let (sw, sh) = win::screen_px();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.wallpaper_job = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let img = (|| {
+                let img = image::open(&file).ok()?.to_rgba8();
+                // No bigger than needed to fill the screen.
+                let scale = (sw.max(1) as f32 / img.width() as f32).max(sh.max(1) as f32 / img.height() as f32);
+                let img = if scale < 0.95 {
+                    let (w, h) = ((img.width() as f32 * scale).ceil() as u32, (img.height() as f32 * scale).ceil() as u32);
+                    image::imageops::resize(&img, w.max(1), h.max(1), image::imageops::FilterType::Triangle)
+                } else {
+                    img
+                };
+                Some((img.width() as usize, img.height() as usize, img.into_raw()))
+            })();
+            let _ = tx.send(img);
+            ctx.request_repaint();
         });
     }
 
@@ -2322,6 +2370,7 @@ ui.ctx().request_repaint();
                     self.load_desktop();
                 }
                 DeskAction::Refresh => {
+                    self.desktop_mtime.clear();
                     self.load_desktop();
                     self.wallpaper_checked = None;
                     self.wallpaper_path = None;
@@ -2424,8 +2473,12 @@ impl eframe::App for ShellApp {
         }
         self.balloon_viewport(ctx, &pal);
         self.tooltip_viewport(ctx, &pal);
-        // Clock + task list refresh.
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // Window changes wake the panel by themselves (win::spawn_window_events).
+        // Otherwise: the clock's next minute, or a slow tick for volume, Wi-Fi
+        // and the desktop folder.
+        let now = chrono::Local::now();
+        let to_minute = Duration::from_millis(60_000 - (now.timestamp_millis().rem_euclid(60_000)) as u64 + 20);
+        ctx.request_repaint_after(to_minute.min(Duration::from_secs(5)));
     }
 }
 
@@ -3394,15 +3447,20 @@ impl ShellApp {
             .with_inner_size([OSD_W, OSD_H])
             .with_position([(screen.x - OSD_W) / 2.0, screen.y - self.lift - PANEL_H - OSD_H - 24.0]);
         let (level, muted) = self.vol_state.unwrap_or((0.0, false));
+        let mut hidden = self.osd_hidden;
         ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_osd"), builder, |ctx, _| {
             // Never takes the focus away from what you're doing.
             if !active {
-                if let Some(h) = win::find_window("Delfin Volume") {
-                    win::hide(h);
+                if !hidden {
+                    if let Some(h) = win::find_window("Delfin Volume") {
+                        win::hide(h);
+                        hidden = true;
+                    }
                 }
                 egui::CentralPanel::default().frame(Frame::none().fill(pal.window)).show(ctx, |_| {});
                 return;
             }
+            hidden = false;
             if !win::reveal_popup("Delfin Volume", false) {
                 ctx.request_repaint();
             }
@@ -3427,6 +3485,7 @@ impl ShellApp {
                     );
                 });
         });
+        self.osd_hidden = hidden;
     }
 }
 

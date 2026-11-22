@@ -111,10 +111,27 @@ impl DevMgr {
             .name("delfin-devices".into())
             .spawn(move || {
                 let mut all = false;
+                let mut last_key = 0u64;
                 loop {
                     let list = sys::list(all);
-                    s.lock().unwrap_or_else(|p| p.into_inner()).devices = Some(list);
-                    ctx.request_repaint();
+                    // Redraw only when something about the devices changed.
+                    let key = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        all.hash(&mut h);
+                        for d in &list {
+                            (&d.instance_id, &d.name, d.problem, d.present, &d.driver_version).hash(&mut h);
+                        }
+                        h.finish()
+                    };
+                    let mut st = s.lock().unwrap_or_else(|p| p.into_inner());
+                    let first = st.devices.is_none();
+                    st.devices = Some(list);
+                    drop(st);
+                    if first || key != last_key {
+                        last_key = key;
+                        ctx.request_repaint();
+                    }
                     // Plugging something in shows up within a few seconds.
                     match rx.recv_timeout(Duration::from_secs(4)) {
                         Ok(a) => all = a,

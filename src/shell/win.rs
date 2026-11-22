@@ -819,6 +819,76 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
     });
 }
 
+// ----------------------------------------------------------------- window events
+
+static EVENTS_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+/// A window changed since the panel last listed them.
+pub static WINDOWS_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// The windows the panel shows (buttons and tray-shelved), for the events above.
+pub static PANEL_WINDOWS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+/// Wake the panel when a window appears, goes away, changes its title, is
+/// minimized or restored, or the foreground window changes. The panel only
+/// redraws then (and for the clock), instead of polling every half second.
+pub fn spawn_window_events(ctx: egui::Context) {
+    let _ = EVENTS_CTX.set(ctx);
+    std::thread::Builder::new()
+        .name("delfin-winevents".into())
+        .spawn(|| unsafe {
+            use windows_sys::Win32::UI::Accessibility::SetWinEventHook;
+            const OUTOFCONTEXT: u32 = 0;
+            const SKIPOWNPROCESS: u32 = 2;
+            // (first, last) event ranges we care about.
+            for (a, b) in [
+                (0x0003u32, 0x0003u32), // EVENT_SYSTEM_FOREGROUND
+                (0x0016, 0x0017),       // EVENT_SYSTEM_MINIMIZESTART / END
+                (0x8000, 0x8003),       // EVENT_OBJECT_CREATE / DESTROY / SHOW / HIDE
+                (0x800B, 0x800C),       // EVENT_OBJECT_LOCATIONCHANGE / NAMECHANGE
+            ] {
+                SetWinEventHook(a, b, null_mut(), Some(win_event), 0, 0, OUTOFCONTEXT | SKIPOWNPROCESS);
+            }
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}
+        })
+        .ok();
+}
+
+unsafe extern "system" fn win_event(
+    _hook: windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    // Only whole windows, not carets, scroll bars or list items.
+    if hwnd.is_null() || id_object != 0 || id_child != 0 {
+        return;
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetAncestor;
+    let relevant = match event {
+        // Moving or resizing: only the foreground window matters (full screen).
+        0x800B => GetForegroundWindow() == hwnd,
+        0x0003 | 0x0016 | 0x0017 => true,
+        // Destroyed or hidden: the window may already be gone, so ask whether
+        // it was on the panel.
+        0x8001 | 0x8003 => PANEL_WINDOWS.lock().is_ok_and(|w| w.contains(&(hwnd as isize))),
+        // Created, shown or renamed: top-level windows only.
+        _ => GetAncestor(hwnd, 2 /* GA_ROOT */) == hwnd,
+    };
+    if !relevant {
+        return;
+    }
+    WINDOWS_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(ctx) = EVENTS_CTX.get() {
+        // Bursts (a title that ticks, a window being dragged) collapse into
+        // a few redraws a second.
+        let delay = if matches!(event, 0x800B | 0x800C) { 250 } else { 60 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(delay));
+    }
+}
+
 // ----------------------------------------------------------------- window switcher
 
 /// While Alt is held, tap an unused key (0xE8): then releasing Alt doesn't

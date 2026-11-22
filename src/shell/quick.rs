@@ -497,16 +497,26 @@ unsafe fn wifi_thread(ctx: egui::Context, rx: Receiver<WifiCmd>, state: Arc<Mute
             }
         }
 
-        {
+        // Wake the UI only when something it shows changed.
+        let changed = {
             let mut s = state.lock().unwrap();
+            let same_nets = s.networks.len() == networks.len()
+                && s.networks
+                    .iter()
+                    .zip(&networks)
+                    .all(|(a, b)| a.ssid == b.ssid && a.signal == b.signal && a.connected == b.connected && a.profile == b.profile);
+            let changed = s.present != guid.is_some() || s.radio_on != radio_on || !same_nets || status.is_some();
             s.present = guid.is_some();
             s.radio_on = radio_on;
             s.networks = networks;
             if let Some(st) = status {
                 s.status = st;
             }
+            changed
+        };
+        if changed {
+            ctx.request_repaint();
         }
-        ctx.request_repaint();
     }
 }
 

@@ -287,12 +287,14 @@ fn worker(ctx: egui::Context, out: Arc<Mutex<Option<Track>>>, rx: Receiver<Cmd>)
             }
             _ => true,
         };
+        // Playing: check every second (position, next track). Paused or
+        // nothing playing: every 3 s is enough. A command wakes it at once.
+        let wait = if now.as_ref().is_some_and(|t| t.playing) { 1000 } else { 3000 };
         *out.lock().unwrap_or_else(|p| p.into_inner()) = now;
         if changed {
             ctx.request_repaint();
         }
-        // Wait a second, or less if a command comes in.
-        if let Ok(c) = rx.recv_timeout(Duration::from_millis(1000)) {
+        if let Ok(c) = rx.recv_timeout(Duration::from_millis(wait)) {
             if let Some(s) = &session {
                 run(s, c);
                 std::thread::sleep(Duration::from_millis(150));

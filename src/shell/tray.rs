@@ -236,7 +236,8 @@ unsafe fn handle_notify(cds: &CopyData) -> bool {
     }
     drop(guard);
     if let Some(c) = CTX.get() {
-        c.request_repaint();
+        // Apps that animate their icon send many updates: draw a few times a second at most.
+        c.request_repaint_after(std::time::Duration::from_millis(100));
     }
     ok
 }
