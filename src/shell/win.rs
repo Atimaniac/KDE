@@ -343,27 +343,6 @@ pub fn set_work_area(reserved_px: i32) {
     }
 }
 
-pub fn wallpaper_path() -> Option<PathBuf> {
-    let mut buf = [0u16; 520];
-    let ok = unsafe {
-        SystemParametersInfoW(
-            0x0073, /* SPI_GETDESKWALLPAPER */
-            buf.len() as u32,
-            buf.as_mut_ptr() as *mut c_void,
-            0,
-        )
-    };
-    if ok != 0 {
-        let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        let s = String::from_utf16_lossy(&buf[..n]);
-        if !s.is_empty() && Path::new(&s).exists() {
-            return Some(PathBuf::from(s));
-        }
-    }
-    // Windows keeps a converted copy here (file has no extension).
-    let t = dirs::config_dir()?.join(r"Microsoft\Windows\Themes\TranscodedWallpaper");
-    t.exists().then_some(t)
-}
 
 // ----------------------------------------------------------------- icons
 

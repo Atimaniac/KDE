@@ -7,6 +7,7 @@
 //! * Starts your startup apps, owns Win+E / Win+D / Win+R / Alt+F1.
 //! * File-manager windows are separate `delfin.exe` processes.
 
+mod desktop;
 pub mod install;
 mod media;
 pub(crate) mod pins;
@@ -18,7 +19,7 @@ mod tray;
 pub(crate) mod win;
 
 use crate::config::Config;
-use crate::fsops::{self, natural_cmp};
+
 use crate::icons::{self, Tool};
 use crate::theme::{self, Palette};
 use eframe::egui::{
@@ -38,7 +39,6 @@ const PANEL_H: f32 = 44.0;
 const LAUNCHER_W: f32 = 780.0;
 const LAUNCHER_H: f32 = 540.0;
 const PANEL_TITLE: &str = "Delfin Panel";
-const DESKTOP_TITLE: &str = "Delfin Desktop";
 /// Tray icons shown directly on the panel; the rest go behind the ^ button.
 const TRAY_INLINE: usize = 8;
 const BALLOON_SECS: u64 = 7;
@@ -66,14 +66,6 @@ pub fn run() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| Ok(Box::new(ShellApp::new(cc)))),
     )
-}
-
-#[derive(Clone)]
-struct DesktopItem {
-    name: String,
-    path: PathBuf,
-    is_dir: bool,
-    ext: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,15 +99,6 @@ enum PanelAction {
     Volume(f32),
 }
 
-enum DeskAction {
-    Open(PathBuf, bool),
-    ShowInDelfin(PathBuf),
-    Terminal(PathBuf),
-    Trash(PathBuf),
-    Refresh,
-    Uri(&'static str),
-}
-
 struct ShellApp {
     cfg: Config,
     own_pid: u32,
@@ -144,18 +127,8 @@ struct ShellApp {
     launcher_seen_focus: bool,
     launcher_closed_at: Instant,
     power_armed: Option<(Power, Instant)>,
-    // desktop
-    desktop: Vec<DesktopItem>,
-    desktop_loaded: Instant,
-    desktop_sel: Option<PathBuf>,
-    wallpaper: Option<TextureHandle>,
-    wallpaper_path: Option<PathBuf>,
-    wallpaper_checked: Option<Instant>,
-    /// A wallpaper being decoded in the background.
-    wallpaper_job: Option<std::sync::mpsc::Receiver<Option<(usize, usize, Vec<u8>)>>>,
-    /// When the desktop folders last changed (only then is the list read again).
-    desktop_mtime: Vec<Option<std::time::SystemTime>>,
-    shell_window_set: bool,
+    /// What was picked on the desktop (its own window and thread, see desktop.rs).
+    desk_rx: std::sync::mpsc::Receiver<desktop::DeskAction>,
     // tray
     tray: Option<tray::Shared>,
     tray_tex: HashMap<(isize, u32), (u64, TextureHandle)>,
@@ -252,6 +225,8 @@ impl ShellApp {
         let (tx, rx) = channel();
         win::spawn_hotkeys(tx, cc.egui_ctx.clone());
         win::spawn_window_events(cc.egui_ctx.clone());
+        let (desk_tx, desk_rx) = channel();
+        desktop::start(desk_tx, cc.egui_ctx.clone(), cfg.dark);
         restore_leftover_shelved();
 
         // Tray host must exist before startup apps run, otherwise they decide
@@ -283,7 +258,7 @@ impl ShellApp {
                 .collect(),
             cc.egui_ctx.clone(),
         );
-        let mut app = Self {
+        let app = Self {
             cfg,
             own_pid: std::process::id(),
             placed: None,
@@ -305,15 +280,7 @@ impl ShellApp {
             launcher_seen_focus: false,
             launcher_closed_at: long_ago,
             power_armed: None,
-            desktop: Vec::new(),
-            desktop_loaded: long_ago,
-            desktop_sel: None,
-            wallpaper: None,
-            wallpaper_path: None,
-            wallpaper_checked: None,
-            wallpaper_job: None,
-            desktop_mtime: Vec::new(),
-            shell_window_set: false,
+            desk_rx,
             tray,
             tray_tex: HashMap::new(),
             overflow_open: false,
@@ -359,7 +326,6 @@ impl ShellApp {
             panel_menu: None,
             menu_cmds: Vec::new(),
         };
-        app.load_desktop();
         app
     }
 
@@ -2069,327 +2035,28 @@ ui.ctx().request_repaint();
 
     // ------------------------------------------------------------ desktop
 
-    fn load_desktop(&mut self) {
-        let mut dirs_: Vec<PathBuf> = Vec::new();
-        if let Some(d) = dirs::desktop_dir() {
-            dirs_.push(d);
-        }
-        if let Ok(p) = std::env::var("PUBLIC") {
-            // The folder is "Desktop" on disk in every language.
-            dirs_.push(PathBuf::from(p).join("Desktop"));
-        }
-        self.desktop_loaded = Instant::now();
-        // Read the folders again only when something in them changed.
-        let mtimes: Vec<Option<std::time::SystemTime>> =
-            dirs_.iter().map(|d| std::fs::metadata(d).and_then(|m| m.modified()).ok()).collect();
-        if mtimes == self.desktop_mtime && !self.desktop.is_empty() {
-            return;
-        }
-        self.desktop_mtime = mtimes;
-        let mut items = Vec::new();
-        for d in dirs_ {
-            let Ok(list) = fsops::list_dir(&d) else {
-                continue;
-            };
-            for e in list {
-                if e.hidden {
-                    continue;
-                }
-                let name = if matches!(e.ext.as_str(), "lnk" | "url") {
-                    e.path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or(e.name)
-                } else {
-                    e.name
-                };
-                items.push(DesktopItem {
-                    name,
-                    path: e.path,
-                    is_dir: e.is_dir,
-                    ext: e.ext,
-                });
-            }
-        }
-        items.sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then_with(|| natural_cmp(&a.name, &b.name))
-        });
-        self.desktop = items;
-    }
-
-    /// Pick up a new wallpaper. The picture is decoded and scaled to the
-    /// screen on another thread, so the desktop never stalls on it.
-    fn refresh_wallpaper(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.wallpaper_job {
-            match rx.try_recv() {
-                Ok(img) => {
-                    self.wallpaper_job = None;
-                    self.wallpaper = img.map(|(w, h, px)| {
-                        ctx.load_texture("wallpaper", egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR)
-                    });
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return,
-                Err(_) => self.wallpaper_job = None,
-            }
-        }
-        if self
-            .wallpaper_checked
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
-        {
-            return;
-        }
-        self.wallpaper_checked = Some(Instant::now());
-        // The same path can hold a new picture (slide shows), so the file's
-        // time is part of the key.
-        let path = win::wallpaper_path().map(|p| {
-            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
-            let secs = t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-            PathBuf::from(format!("{}|{secs}", p.display()))
-        });
-        if path == self.wallpaper_path {
-            return;
-        }
-        self.wallpaper_path = path.clone();
-        let Some(key) = path else {
-            self.wallpaper = None;
-            return;
-        };
-        let file = PathBuf::from(key.to_string_lossy().rsplit_once('|').map(|(p, _)| p.to_string()).unwrap_or_default());
-        let (sw, sh) = win::screen_px();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.wallpaper_job = Some(rx);
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let img = (|| {
-                let img = image::open(&file).ok()?.to_rgba8();
-                // No bigger than needed to fill the screen.
-                let scale = (sw.max(1) as f32 / img.width() as f32).max(sh.max(1) as f32 / img.height() as f32);
-                let img = if scale < 0.95 {
-                    let (w, h) = ((img.width() as f32 * scale).ceil() as u32, (img.height() as f32 * scale).ceil() as u32);
-                    image::imageops::resize(&img, w.max(1), h.max(1), image::imageops::FilterType::Triangle)
-                } else {
-                    img
-                };
-                Some((img.width() as usize, img.height() as usize, img.into_raw()))
-            })();
-            let _ = tx.send(img);
-            ctx.request_repaint();
-        });
-    }
-
-    fn desktop_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
-        let screen = Self::screen_points(ctx);
-        let builder = ViewportBuilder::default()
-            .with_title(DESKTOP_TITLE)
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_window_level(WindowLevel::AlwaysOnBottom)
-            .with_position([0.0, 0.0])
-            .with_inner_size(screen);
-
-        let mut actions: Vec<DeskAction> = Vec::new();
-        ctx.show_viewport_immediate(
-            ViewportId::from_hash_of("delfin_desktop"),
-            builder,
-            |ctx, _| {
-                self.refresh_wallpaper(ctx);
-                if self.desktop_loaded.elapsed() > Duration::from_secs(3) {
-                    self.load_desktop();
-                }
-                egui::CentralPanel::default()
-                    .frame(Frame::none())
-                    .show(ctx, |ui| {
-                        let rect = ui.max_rect();
-                        // Wallpaper ("fill" mode) or a Breeze-ish gradient.
-                        if let Some(tex) = &self.wallpaper {
-                            let ts = tex.size_vec2();
-                            let scale = (rect.width() / ts.x).max(rect.height() / ts.y);
-                            let uv = Rect::from_center_size(
-                                pos2(0.5, 0.5),
-                                vec2(
-                                    rect.width() / (ts.x * scale),
-                                    rect.height() / (ts.y * scale),
-                                ),
-                            );
-                            ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
-                        } else {
-                            let mut mesh = egui::Mesh::default();
-                            let top = Color32::from_rgb(0x1d, 0x2b, 0x3a);
-                            let bottom = Color32::from_rgb(0x0e, 0x4d, 0x6e);
-                            mesh.colored_vertex(rect.left_top(), top);
-                            mesh.colored_vertex(rect.right_top(), top);
-                            mesh.colored_vertex(rect.right_bottom(), bottom);
-                            mesh.colored_vertex(rect.left_bottom(), bottom);
-                            mesh.add_triangle(0, 1, 2);
-                            mesh.add_triangle(0, 2, 3);
-                            ui.painter().add(Shape::mesh(mesh));
-                        }
-
-                        let bg = ui.interact(rect, egui::Id::new("desktop_bg"), Sense::click());
-                        if bg.clicked() {
-                            self.desktop_sel = None;
-                        }
-                        bg.context_menu(|ui| {
-                            ui.set_min_width(220.0);
-                            if let Some(d) = dirs::desktop_dir() {
-                                if ui.button(crate::i18n::tr("Open Desktop Folder")).clicked() {
-                                    actions.push(DeskAction::Open(d.clone(), true));
-                                    ui.close_menu();
-                                }
-                                if ui.button(crate::i18n::tr("Open Terminal Here")).clicked() {
-                                    actions.push(DeskAction::Terminal(d));
-                                    ui.close_menu();
-                                }
-                            }
-                            if ui.button(crate::i18n::tr("Refresh")).clicked() {
-                                actions.push(DeskAction::Refresh);
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(crate::i18n::tr("Change Wallpaper…")).clicked() {
-                                actions.push(DeskAction::Uri(
-                                    "ms-settings:personalization-background",
-                                ));
-                                ui.close_menu();
-                            }
-                            if ui.button(crate::i18n::tr("Display Settings…")).clicked() {
-                                actions.push(DeskAction::Uri("ms-settings:display"));
-                                ui.close_menu();
-                            }
-                        });
-
-                        // Icons, column by column from the top-left.
-                        let cell = vec2(96.0, 100.0);
-                        let origin = rect.min + vec2(10.0, 10.0);
-                        let rows = (((rect.height() - 20.0) / cell.y).floor() as usize).max(1);
-                        let items = self.desktop.clone();
-                        for (i, it) in items.iter().enumerate() {
-                            let (col, row) = (i / rows, i % rows);
-                            let r = Rect::from_min_size(
-                                origin + vec2(col as f32 * cell.x, row as f32 * cell.y),
-                                cell,
-                            );
-                            let resp =
-                                ui.interact(r, egui::Id::new(("desk", &it.path)), Sense::click());
-                            let selected = self.desktop_sel.as_ref() == Some(&it.path);
-                            if selected {
-                                ui.painter().rect_filled(r, 6.0, pal.select);
-                                ui.painter()
-                                    .rect_stroke(r, 6.0, Stroke::new(1.0_f32, pal.accent));
-                            } else if resp.hovered() {
-                                ui.painter()
-                                    .rect_filled(r, 6.0, Color32::from_white_alpha(30));
-                            }
-                            let ir = Rect::from_center_size(
-                                pos2(r.center().x, r.top() + 30.0),
-                                vec2(48.0, 48.0),
-                            );
-                            if it.is_dir {
-                                icons::paint_folder(ui.painter(), ir, icons::FOLDER);
-                            } else if let Some(tex) = self.tex_file(ctx, &it.path, true) {
-                                ui.painter().image(tex.id(), ir, uv_full(), Color32::WHITE);
-                            } else {
-                                icons::paint_entry_icon(ui.painter(), ir, false, &it.ext, pal);
-                            }
-                            let label_pos = pos2(r.center().x, ir.bottom() + 6.0);
-                            let shadow =
-                                label(ui, &it.name, cell.x - 8.0, Color32::from_black_alpha(200));
-                            ui.painter()
-                                .galley(label_pos + vec2(1.0, 1.0), shadow, Color32::BLACK);
-                            let text = label(ui, &it.name, cell.x - 8.0, Color32::WHITE);
-                            ui.painter().galley(label_pos, text, Color32::WHITE);
-
-                            if resp.clicked() {
-                                self.desktop_sel = Some(it.path.clone());
-                            }
-                            if resp.double_clicked() {
-                                actions.push(DeskAction::Open(it.path.clone(), it.is_dir));
-                            }
-                            if resp.secondary_clicked() {
-                                self.desktop_sel = Some(it.path.clone());
-                            }
-                            resp.context_menu(|ui| {
-                                ui.set_min_width(200.0);
-                                if ui.button(crate::i18n::tr("Open")).clicked() {
-                                    actions.push(DeskAction::Open(it.path.clone(), it.is_dir));
-                                    ui.close_menu();
-                                }
-                                if !it.is_dir && ui.button(crate::i18n::tr("Show in Delfin")).clicked() {
-                                    actions.push(DeskAction::ShowInDelfin(it.path.clone()));
-                                    ui.close_menu();
-                                }
-                                if it.is_dir && ui.button(crate::i18n::tr("Open Terminal Here")).clicked() {
-                                    actions.push(DeskAction::Terminal(it.path.clone()));
-                                    ui.close_menu();
-                                }
-                                // Programs and shortcuts: pin to the panel.
-                                let ext = it.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-                                if !it.is_dir && ["exe", "lnk", "url", "appref-ms"].contains(&ext.as_str()) {
-                                    let name = it.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                                    let target = Launch::Path(it.path.clone());
-                                    let pinned = self.pins.iter().any(|p| p.same_target(&target));
-                                    let label = if pinned { crate::i18n::tr("Unpin from taskbar") } else { crate::i18n::tr("Pin to taskbar") };
-                                    if ui.button(label).clicked() {
-                                        self.menu_cmds.push(if pinned { MenuCmd::Unpin(target) } else { MenuCmd::Pin(pins::Pin::new(name, target)) });
-ui.ctx().request_repaint();
-                                        ui.close_menu();
-                                    }
-                                }
-                                ui.separator();
-                                if ui.button(crate::i18n::tr("Move to Trash")).clicked() {
-                                    actions.push(DeskAction::Trash(it.path.clone()));
-                                    ui.close_menu();
-                                }
-                                ui.separator();
-                                if ui.button(crate::i18n::tr("Properties")).clicked() {
-                                    self.menu_cmds.push(MenuCmd::Props(it.path.clone()));
-ui.ctx().request_repaint();
-                                    ui.close_menu();
-                                }
-                            });
-                        }
-                    });
-            },
-        );
-
-        // Register the desktop as the shell window once it exists.
-        if !self.shell_window_set {
-            if let Some(h) = win::find_window(DESKTOP_TITLE) {
-                win::set_shell_window(h);
-                self.shell_window_set = true;
-            }
-        }
-
-        for a in actions {
+    /// Carry out what was picked on the desktop (see `desktop.rs`).
+    fn desk_actions(&mut self) {
+        while let Ok(a) = self.desk_rx.try_recv() {
             match a {
-                DeskAction::Open(p, true) => win::spawn_self(Some(&p)),
-                DeskAction::Open(p, false) => {
-                    win::shell_open(&p);
-                }
-                DeskAction::ShowInDelfin(p) => {
+                desktop::DeskAction::Open(p, true) => win::spawn_self(Some(&p)),
+                desktop::DeskAction::Open(p, false) => win::shell_open(&p),
+                desktop::DeskAction::ShowInDelfin(p) => {
                     if let Some(parent) = p.parent() {
                         win::spawn_self(Some(parent));
                     }
                 }
-                DeskAction::Terminal(p) => {
+                desktop::DeskAction::Terminal(p) => {
                     let _ = crate::platform::open_terminal(&p);
                 }
-                DeskAction::Trash(p) => {
+                desktop::DeskAction::Trash(p) => {
                     let _ = trash::delete(&p);
-                    self.load_desktop();
+                    desktop::refresh();
                 }
-                DeskAction::Refresh => {
-                    self.desktop_mtime.clear();
-                    self.load_desktop();
-                    self.wallpaper_checked = None;
-                    self.wallpaper_path = None;
-                }
-                DeskAction::Uri(u) => {
-                    self.open_uri(u);
-                }
+                desktop::DeskAction::Pin(name, p) => self.menu_cmds.push(MenuCmd::Pin(pins::Pin::new(name, Launch::Path(p)))),
+                desktop::DeskAction::Unpin(p) => self.menu_cmds.push(MenuCmd::Unpin(Launch::Path(p))),
+                desktop::DeskAction::Props(p) => self.menu_cmds.push(MenuCmd::Props(p)),
+                desktop::DeskAction::Uri(u) => self.open_uri(u),
             }
         }
     }
@@ -2448,8 +2115,8 @@ impl eframe::App for ShellApp {
             }
         }
 
+        self.desk_actions();
         self.panel_ui(ctx, &pal);
-        self.desktop_viewport(ctx, &pal);
         if self.switcher.is_some() {
             self.switcher_viewport(ctx, &pal);
         }
@@ -2500,14 +2167,6 @@ fn uv_full() -> Rect {
     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
 }
 
-fn label(ui: &Ui, text: &str, width: f32, color: Color32) -> std::sync::Arc<egui::Galley> {
-    let mut job =
-        egui::text::LayoutJob::simple(text.to_owned(), FontId::proportional(13.0), color, width);
-    job.wrap.max_rows = 2;
-    job.wrap.overflow_character = Some('…');
-    job.halign = Align::Center;
-    ui.fonts(|f| f.layout_job(job))
-}
 
 fn launcher_button(ui: &mut Ui, open: bool, pal: &Palette) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 36.0), Sense::click());
