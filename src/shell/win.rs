@@ -792,6 +792,14 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
         for (id, m, vk) in keys {
             RegisterHotKey(null_mut(), id, m, vk);
         }
+        // Volume and media keys as system hotkeys too: when the keyboard hook
+        // misses one (an elevated window in front, or Windows dropped the hook
+        // for a moment) it must still change the master volume, not reach the
+        // app in front (players turn their own volume down then). Volume keys
+        // repeat while held.
+        for (id, vk, repeat) in [(30, 0xAFu32, true), (31, 0xAE, true), (32, 0xAD, false), (33, 0xB0, false), (34, 0xB1, false), (35, 0xB2, false), (36, 0xB3, false)] {
+            RegisterHotKey(null_mut(), id, if repeat { 0 } else { NOREPEAT }, vk);
+        }
         // Win+1 … Win+9: the pinned apps, in order.
         for k in 0..9u32 {
             RegisterHotKey(null_mut(), 14 + k as i32, MOD_WIN | NOREPEAT, b'1' as u32 + k);
@@ -840,6 +848,13 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
                     12 => Hotkey::Notifications,
                     13 => Hotkey::PowerMenu,
                     n @ 14..=22 => Hotkey::Pin(n - 14),
+                    30 => Hotkey::Volume(1),
+                    31 => Hotkey::Volume(-1),
+                    32 => Hotkey::Volume(0),
+                    33 => Hotkey::Media(MediaKey::Next),
+                    34 => Hotkey::Media(MediaKey::Prev),
+                    35 => Hotkey::Media(MediaKey::Stop),
+                    36 => Hotkey::Media(MediaKey::PlayPause),
                     _ => continue,
                 };
                 let _ = tx.send(k);
