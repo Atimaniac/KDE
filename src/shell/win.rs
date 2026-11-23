@@ -216,6 +216,10 @@ pub fn reveal_popup(title: &str, activate: bool) -> bool {
         let ex = (ex | 0x80 /* WS_EX_TOOLWINDOW */) & !0x4_0000 /* WS_EX_APPWINDOW */;
         SetWindowLongPtrW(hw, -20, ex);
         round_corners(h);
+        // Opening effect (Settings › Personalization): starts invisible.
+        if super::anim::animated(title) {
+            super::anim::prepare_open(hw);
+        }
         ShowWindow(hw, if activate { 5 /* SW_SHOW */ } else { 4 /* SW_SHOWNOACTIVATE */ });
         if activate {
             SetForegroundWindow(hw);

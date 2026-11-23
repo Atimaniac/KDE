@@ -993,4 +993,17 @@ const PL: &[(&str, &str)] = &[
     ("Can't eject {}", "Nie można wysunąć: {}"),
     ("A program is still using the device.", "Jakiś program wciąż używa tego urządzenia."),
     ("Windows refused to stop the device.", "Windows nie zatrzymał urządzenia."),
+    // Window effects
+    ("Window effects", "Efekty okien"),
+    ("How the start menu, quick settings and other Delfin pop-ups open and close", "Jak otwierają się i zamykają menu start, szybkie ustawienia i inne okienka Delfina"),
+    ("Fade", "Zanikanie"),
+    ("Slide", "Wysuwanie"),
+    ("Glide", "Szybowanie"),
+    ("Spring", "Sprężyna"),
+    ("Fast", "Szybko"),
+    ("Slow", "Wolno"),
+    ("Windows animations", "Animacje Windows"),
+    ("Windows minimizing and maximizing, controls inside windows", "Minimalizowanie i maksymalizowanie okien, kontrolki w oknach"),
+    ("Grow", "Powiększanie"),
+    ("Normal speed", "Normalnie"),
 ];

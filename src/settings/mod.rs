@@ -453,6 +453,7 @@ struct Cached {
     battery: Option<(u8, bool)>,
     /// Aero settings shown on the Personalization page.
     look: crate::config::Config,
+    win_anim: bool,
 }
 
 impl Settings {
@@ -631,6 +632,7 @@ impl Settings {
             Page::Personalization => {
                 self.cached.fit = sys::wallpaper_fit();
                 self.cached.look = crate::config::Config::load();
+                self.cached.win_anim = sys::windows_animations();
                 self.cached.transparency = sys::transparency();
                 self.wallpaper = sys::wallpaper();
                 self.load_wallpaper(ctx);
@@ -2721,6 +2723,44 @@ impl Settings {
             saved.aero_strength = cfg.aero_strength;
             saved.save();
             theme::notify_shell();
+        }
+
+        // Opening and closing effects of Delfin's pop-ups, and Windows' own animations.
+        let mut fx = self.cached.look.win_fx;
+        let mut speed = self.cached.look.win_fx_speed;
+        let effects: Vec<(u8, String)> = crate::shell::anim::EFFECTS.iter().map(|e| (e.index(), tr(e.name()).to_string())).collect();
+        let speeds = vec![(0u8, tr("Fast").to_string()), (1, tr("Normal speed").to_string()), (2, tr("Slow").to_string())];
+        let mut changed = false;
+        row_with(
+            ui,
+            lk,
+            Some(Ico::Sliders),
+            tr("Window effects"),
+            tr("How the start menu, quick settings and other Delfin pop-ups open and close"),
+            false,
+            380.0,
+            |ui| {
+                changed |= combo(ui, "fxspeed", 120.0, &mut speed, &speeds);
+                changed |= combo(ui, "fx", 200.0, &mut fx, &effects);
+            },
+        );
+        if changed {
+            self.cached.look.win_fx = fx;
+            self.cached.look.win_fx_speed = speed;
+            let mut saved = crate::config::Config::load();
+            saved.win_fx = fx;
+            saved.win_fx_speed = speed;
+            saved.save();
+            theme::notify_shell();
+        }
+        let mut win_anim = self.cached.win_anim;
+        let mut changed = false;
+        row_with(ui, lk, Some(Ico::Monitor), tr("Windows animations"), tr("Windows minimizing and maximizing, controls inside windows"), false, 160.0, |ui| {
+            changed = switch(ui, &pal, &mut win_anim);
+        });
+        if changed {
+            sys::set_windows_animations(win_anim);
+            self.cached.win_anim = win_anim;
         }
 
         section(ui, tr("Related settings"));

@@ -1020,3 +1020,25 @@ pub fn hardware() -> Hardware {
     hw.usable_ram = about().ram;
     hw
 }
+
+// ------------------------------------------------------------------ Windows' own animations
+
+/// Windows' animations: windows minimizing / maximizing and controls inside windows.
+pub fn windows_animations() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, ANIMATIONINFO};
+    unsafe {
+        let mut ai = ANIMATIONINFO { cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32, iMinAnimate: 0 };
+        SystemParametersInfoW(0x0048 /* SPI_GETANIMATION */, ai.cbSize, &mut ai as *mut _ as *mut _, 0);
+        ai.iMinAnimate != 0
+    }
+}
+
+pub fn set_windows_animations(on: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, ANIMATIONINFO};
+    unsafe {
+        let mut ai = ANIMATIONINFO { cbSize: std::mem::size_of::<ANIMATIONINFO>() as u32, iMinAnimate: on as i32 };
+        SystemParametersInfoW(0x0049 /* SPI_SETANIMATION */, ai.cbSize, &mut ai as *mut _ as *mut _, 0x1 | 0x2);
+        // SPI_SETCLIENTAREAANIMATION
+        SystemParametersInfoW(0x1043, 0, on as usize as *mut _, 0x1 | 0x2);
+    }
+}

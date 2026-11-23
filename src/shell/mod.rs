@@ -7,6 +7,7 @@
 //! * Starts your startup apps, owns Win+E / Win+D / Win+R / Alt+F1.
 //! * File-manager windows are separate `delfin.exe` processes.
 
+pub(crate) mod anim;
 pub(crate) mod audio;
 mod desktop;
 pub mod install;
@@ -240,6 +241,8 @@ struct ShellApp {
     menu_cmds: Vec<MenuCmd>,
     /// The shell is ending on purpose (restart after an update).
     quitting: bool,
+    /// Pop-ups open in the last frame (for closing effects).
+    fx_open: Vec<&'static str>,
     /// Windows whose blur (Aero) was set, and to what.
     aero_applied: HashMap<isize, bool>,
 }
@@ -271,6 +274,7 @@ impl ShellApp {
         theme::install_fonts(&cc.egui_ctx);
         let cfg = Config::load();
         theme::apply(&cc.egui_ctx, cfg.dark || cfg.aero);
+        anim::configure(cfg.win_fx, cfg.win_fx_speed);
         spawn_look_waiter(cc.egui_ctx.clone());
 
         let (tx, rx) = channel();
@@ -390,6 +394,7 @@ impl ShellApp {
             panel_menu: None,
             menu_cmds: Vec::new(),
             quitting: false,
+            fx_open: Vec::new(),
             aero_applied: HashMap::new(),
         };
         app
@@ -2227,6 +2232,9 @@ ui.ctx().request_repaint();
         self.cfg.aero = c.aero;
         self.cfg.aero_color = c.aero_color;
         self.cfg.aero_strength = c.aero_strength;
+        self.cfg.win_fx = c.win_fx;
+        self.cfg.win_fx_speed = c.win_fx_speed;
+        anim::configure(c.win_fx, c.win_fx_speed);
         theme::apply(ctx, self.cfg.dark || self.cfg.aero);
         self.aero_applied.clear();
         ctx.request_repaint();
@@ -2663,6 +2671,28 @@ impl eframe::App for ShellApp {
         }
         self.balloon_viewport(ctx, &pal);
         self.tooltip_viewport(ctx, &pal);
+        // Closing effects: pop-ups that were open and are closing now (their
+        // windows still exist until this frame ends).
+        let open_now: Vec<&'static str> = [
+            ("Delfin Launcher", self.launcher_open),
+            ("Delfin Quick Settings", self.quick_open.is_some()),
+            ("Delfin Calendar", self.calendar_open),
+            ("Delfin Media", self.media_open),
+            ("Delfin Notifications", self.notif_open),
+            ("Delfin Menu", self.panel_menu.is_some()),
+            ("Delfin Tray", self.overflow_open),
+            ("Delfin Toast", self.toast.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, open)| *open)
+        .map(|(t, _)| t)
+        .collect();
+        for t in std::mem::take(&mut self.fx_open) {
+            if !open_now.contains(&t) {
+                anim::play_close(t);
+            }
+        }
+        self.fx_open = open_now;
         // Window changes wake the panel by themselves (win::spawn_window_events).
         // Otherwise: the clock's next minute, or a slow tick for volume, Wi-Fi
         // and the desktop folder.

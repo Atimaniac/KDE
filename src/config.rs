@@ -31,6 +31,9 @@ pub struct Config {
     /// Glass colour (RGB) and how strong it is (0–100).
     pub aero_color: [u8; 3],
     pub aero_strength: u8,
+    /// Opening and closing effect of the shell's pop-ups (see shell::anim) and its speed (0 fast, 1 normal, 2 slow).
+    pub win_fx: u8,
+    pub win_fx_speed: u8,
 }
 
 impl Default for Config {
@@ -50,6 +53,8 @@ impl Default for Config {
             aero: false,
             aero_color: [0x74, 0xb8, 0xfc],
             aero_strength: 45,
+            win_fx: 3,
+            win_fx_speed: 1,
         }
     }
 }
@@ -105,6 +110,8 @@ impl Config {
                         c.aero_color = [(x >> 16) as u8, (x >> 8) as u8, x as u8];
                     }
                 }
+                "win_fx" => c.win_fx = v.parse().unwrap_or(3),
+                "win_fx_speed" => c.win_fx_speed = v.parse().unwrap_or(1),
                 "aero_strength" => {
                     if let Ok(x) = v.parse::<u8>() {
                         c.aero_strength = x.min(100);
@@ -148,6 +155,7 @@ impl Config {
         s += &format!("aero={}\n", b(self.aero));
         s += &format!("aero_color={:02x}{:02x}{:02x}\n", self.aero_color[0], self.aero_color[1], self.aero_color[2]);
         s += &format!("aero_strength={}\n", self.aero_strength);
+        s += &format!("win_fx={}\nwin_fx_speed={}\n", self.win_fx, self.win_fx_speed);
         for p in &self.places {
             s += &format!("place={}\n", p.display());
         }
