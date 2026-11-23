@@ -286,6 +286,11 @@ enum Action {
     ShowInfo,
     SelectAll,
     FolderHandler(bool),
+    /// Unpack the selected archives: here (true) or each into its own folder.
+    Extract(bool),
+    /// Pack the selection into an archive of this type ("zip", "7z").
+    Compress(&'static str),
+    OpenIn7Zip(PathBuf),
 }
 
 #[derive(Default)]
@@ -708,6 +713,41 @@ impl App {
                     .map(|&i| p.entries[i].path.clone())
                     .collect();
             }),
+            #[cfg(windows)]
+            Action::Extract(here) => {
+                let cwd = self.pane().cwd.clone();
+                for a in self.pane().selected_paths().into_iter().filter(|p| crate::archive::is_archive(p)) {
+                    let dest = if here { cwd.clone() } else { crate::archive::unique(&cwd, &crate::archive::base_name(&a), "") };
+                    let name = display_name(&a);
+                    self.spawn(ctx, move || {
+                        crate::archive::extract(&a, &dest)
+                            .map(|_| crate::i18n::trf("Extracted {}", &[&name]))
+                            .map_err(|e| crate::i18n::trf("Cannot extract {}: {}", &[&name, &e]))
+                    });
+                }
+            }
+            #[cfg(windows)]
+            Action::Compress(ext) => {
+                let paths = self.pane().selected_paths();
+                if !paths.is_empty() {
+                    let cwd = self.pane().cwd.clone();
+                    let target = crate::archive::unique(&cwd, &crate::archive::pack_name(&paths), ext);
+                    let name = display_name(&target);
+                    self.spawn(ctx, move || {
+                        crate::archive::compress(&paths, &target)
+                            .map(|_| crate::i18n::trf("Created {}", &[&name]))
+                            .map_err(|e| crate::i18n::trf("Cannot create {}: {}", &[&name, &e]))
+                    });
+                }
+            }
+            #[cfg(windows)]
+            Action::OpenIn7Zip(p) => {
+                if let Err(e) = crate::archive::open_in_7zip(&p) {
+                    self.err(e);
+                }
+            }
+            #[cfg(not(windows))]
+            Action::Extract(_) | Action::Compress(_) | Action::OpenIn7Zip(_) => {}
         }
     }
 
@@ -2002,7 +2042,33 @@ fn mi(ui: &mut Ui, label: &str, shortcut: &str) -> bool {
     clicked
 }
 
-fn item_menu(ui: &mut Ui, path: &Path, is_dir: bool, out: &mut PaneOut) {
+/// Archive entries: unpack archives, pack anything. `pack` is the name the new archive gets.
+#[cfg(windows)]
+fn archive_menu(ui: &mut Ui, path: &Path, pack: &str, out: &mut PaneOut) {
+    use crate::archive;
+    use crate::i18n::{tr, trf};
+    let seven = archive::seven_zip().is_some();
+    ui.separator();
+    if archive::is_archive(path) {
+        if mi(ui, tr("Extract Here"), "") {
+            out.actions.push(Action::Extract(true));
+        }
+        if mi(ui, &trf("Extract to \"{}\\\"", &[&archive::base_name(path)]), "") {
+            out.actions.push(Action::Extract(false));
+        }
+        if seven && mi(ui, tr("Open in 7-Zip"), "") {
+            out.actions.push(Action::OpenIn7Zip(path.to_path_buf()));
+        }
+    }
+    if mi(ui, &trf("Add to \"{}\"", &[&format!("{pack}.zip")]), "") {
+        out.actions.push(Action::Compress("zip"));
+    }
+    if seven && mi(ui, &trf("Add to \"{}\"", &[&format!("{pack}.7z")]), "") {
+        out.actions.push(Action::Compress("7z"));
+    }
+}
+
+fn item_menu(ui: &mut Ui, path: &Path, is_dir: bool, pack: &str, out: &mut PaneOut) {
     ui.set_min_width(230.0);
     if mi(ui, crate::i18n::tr("Open"), "Enter") {
         out.actions.push(Action::OpenSelected);
@@ -2025,6 +2091,10 @@ fn item_menu(ui: &mut Ui, path: &Path, is_dir: bool, out: &mut PaneOut) {
     if mi(ui, crate::i18n::tr("Copy Location"), "") {
         out.actions.push(Action::CopyPath);
     }
+    #[cfg(windows)]
+    archive_menu(ui, path, pack, out);
+    #[cfg(not(windows))]
+    let _ = pack;
     ui.separator();
     if mi(ui, crate::i18n::tr("Rename…"), "F2") {
         out.actions.push(Action::Rename);
@@ -2132,7 +2202,17 @@ fn handle_item(ui: &Ui, pane: &mut Pane, vi: usize, resp: &egui::Response, out: 
         }
         out.activated = true;
     }
-    resp.context_menu(|ui| item_menu(ui, &path, is_dir, out));
+    resp.context_menu(|ui| {
+        // Name a new archive would get: the item's own, or the folder's for several items.
+        let pack = if pane.selected.len() > 1 {
+            pane.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| crate::i18n::tr("Archive").into())
+        } else if is_dir {
+            display_name(&path)
+        } else {
+            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        item_menu(ui, &path, is_dir, &pack, out)
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

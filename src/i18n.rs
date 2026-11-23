@@ -147,6 +147,19 @@ pub fn weekday_short(d: u32) -> &'static str {
 
 const PL: &[(&str, &str)] = &[
     // ---- file manager
+    ("Extract Here", "Wypakuj tutaj"),
+    ("Extract to \"{}\\\"", "Wypakuj do „{}\\”"),
+    ("Open in 7-Zip", "Otwórz w 7-Zip"),
+    ("Add to \"{}\"", "Dodaj do „{}”"),
+    ("Extracted {}", "Wypakowano {}"),
+    ("Cannot extract {}: {}", "Nie można wypakować {}: {}"),
+    ("Created {}", "Utworzono {}"),
+    ("Cannot create {}: {}", "Nie można utworzyć {}: {}"),
+    ("Cannot process {}: {}", "Nie można przetworzyć {}: {}"),
+    ("The archive could not be processed", "Nie udało się przetworzyć archiwum"),
+    ("7-Zip is not installed", "7-Zip nie jest zainstalowany"),
+    ("Nothing selected", "Nic nie zaznaczono"),
+    ("Archive", "Archiwum"),
     ("About Delfin", "O programie Delfin"),
     ("Add Folder to Places", "Dodaj folder do Miejsc"),
     ("Add to Places", "Dodaj do Miejsc"),

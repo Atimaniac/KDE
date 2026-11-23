@@ -12,7 +12,7 @@
 use eframe::egui;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::Sender;
 use std::time::SystemTime;
@@ -411,6 +411,16 @@ unsafe fn menu(hwnd: HWND, i: Option<usize>) {
                 add(4, if pinned { tr("Unpin from taskbar") } else { tr("Pin to taskbar") });
             }
             sep();
+            if crate::archive::is_archive(p) {
+                add(7, tr("Extract Here"));
+                add(8, &crate::i18n::trf("Extract to \"{}\\\"", &[&crate::archive::base_name(p)]));
+            }
+            let pack = crate::archive::pack_name(std::slice::from_ref(p));
+            add(9, &crate::i18n::trf("Add to \"{}\"", &[&format!("{pack}.zip")]));
+            if crate::archive::seven_zip().is_some() {
+                add(15, &crate::i18n::trf("Add to \"{}\"", &[&format!("{pack}.7z")]));
+            }
+            sep();
             add(5, tr("Move to Trash"));
             sep();
             add(6, tr("Properties"));
@@ -438,6 +448,7 @@ unsafe fn menu(hwnd: HWND, i: Option<usize>) {
         (4, Some((p, _, name))) => send(if pinned { DeskAction::Unpin(p) } else { DeskAction::Pin(name, p) }),
         (5, Some((p, _, _))) => send(DeskAction::Trash(p)),
         (6, Some((p, _, _))) => send(DeskAction::Props(p)),
+        (7 | 8 | 9 | 15, Some((p, _, _))) => archive_job(cmd, p),
         (10, _) => {
             if let Some(d) = desktop {
                 send(DeskAction::Open(d, true));
@@ -456,6 +467,31 @@ unsafe fn menu(hwnd: HWND, i: Option<usize>) {
         (14, _) => send(DeskAction::Uri("ms-settings:display")),
         _ => {}
     }
+}
+
+/// Unpack (7 here, 8 into a folder) or pack (9 zip, 15 7z) a desktop item in the
+/// background; the desktop picks the result up on its next folder check.
+fn archive_job(cmd: usize, p: PathBuf) {
+    use crate::archive;
+    std::thread::spawn(move || {
+        let Some(dir) = p.parent().map(Path::to_path_buf) else { return };
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let res = match cmd {
+            7 => archive::extract(&p, &dir),
+            8 => archive::extract(&p, &archive::unique(&dir, &archive::base_name(&p), "")),
+            _ => {
+                let paths = [p.clone()];
+                let target = archive::unique(&dir, &archive::pack_name(&paths), if cmd == 15 { "7z" } else { "zip" });
+                archive::compress(&paths, &target)
+            }
+        };
+        match res {
+            Err(e) if e != crate::i18n::tr("Cancelled") => {
+                crate::platform::message("Delfin", &crate::i18n::trf("Cannot process {}: {}", &[&name, &e]))
+            }
+            _ => {}
+        }
+    });
 }
 
 fn set_sel(hwnd: HWND, sel: Option<usize>) {

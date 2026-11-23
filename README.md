@@ -58,6 +58,9 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
   Do not disturb, `Win+N`), window snapping (`Win+arrows`, dragging to an edge or corner with a preview),
   `Win+X` menu, `Win+I` Settings, `Win+A` quick settings, `Win+1…9` pinned apps, the keyboard language
   indicator and safely removing USB drives. Sound devices are switched in Settings and quick settings.
+- **Archives** (right-click in the file manager or on the desktop): *Extract Here*, *Extract to "name\"*,
+  *Open in 7-Zip* and *Add to "name.zip"* / *"name.7z"*. Uses 7-Zip when it is installed (its progress
+  window, password and overwrite questions), otherwise the `tar` that comes with Windows.
 - **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher, `Alt+Tab` window
   switcher, `Ctrl+Shift+Esc` task manager.
 - Folders opened anywhere in Windows open in Delfin.
