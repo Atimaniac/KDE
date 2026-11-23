@@ -54,6 +54,10 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
   sleep, storage and cleanup, about / rename PC), Bluetooth & devices, mouse, network & Wi-Fi,
   personalization (wallpaper, dark mode), installed apps (uninstall), startup apps, accounts, time zone and
   language, Windows Update (check, install, history) and Delfin's own options. Search with Ctrl+F.
+- **What Explorer used to do**: app notifications (pop-ups and a notification centre behind the bell,
+  Do not disturb, `Win+N`), window snapping (`Win+arrows`, dragging to an edge or corner with a preview),
+  `Win+X` menu, `Win+I` Settings, `Win+A` quick settings, `Win+1…9` pinned apps, the keyboard language
+  indicator and safely removing USB drives. Sound devices are switched in Settings and quick settings.
 - **Shortcuts**: `Win+E` file manager, `Win+D` show desktop, `Win+R` / `Alt+F1` launcher, `Alt+Tab` window
   switcher, `Ctrl+Shift+Esc` task manager.
 - Folders opened anywhere in Windows open in Delfin.

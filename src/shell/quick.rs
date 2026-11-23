@@ -534,7 +534,7 @@ impl Section {
     /// Panel height in points.
     pub fn height(self) -> f32 {
         match self {
-            Section::Sound => 250.0,
+            Section::Sound => 290.0,
             Section::Network => 480.0,
         }
     }
@@ -549,6 +549,8 @@ pub struct QuickPanel {
     pub wifi: Wifi,
     pub bright: Brightness,
     vol: Option<Volume>,
+    /// Playback devices, to switch the default one.
+    outputs: Vec<super::audio::Device>,
     expanded: Option<String>,
     password: String,
 }
@@ -559,6 +561,7 @@ impl QuickPanel {
             wifi: Wifi::start(ctx.clone()),
             bright: Brightness::start(ctx.clone()),
             vol: Volume::open(),
+            outputs: Vec::new(),
             expanded: None,
             password: String::new(),
         }
@@ -566,6 +569,7 @@ impl QuickPanel {
 
     pub fn on_open(&mut self) {
         self.vol = Volume::open(); // the default device may have changed
+        self.outputs = super::audio::devices(true);
         self.wifi.set_active(true);
         self.expanded = None;
         self.password.clear();
@@ -683,6 +687,24 @@ impl QuickPanel {
                 }
                 ui.label(format!("{level:.0}%"));
             });
+        }
+        // Where the sound goes (only when there is a choice).
+        if self.outputs.len() > 1 {
+            let current = self.outputs.iter().position(|d| d.default).unwrap_or(0);
+            let mut pick = current;
+            egui::ComboBox::from_id_salt("quick-output")
+                .width(ui.available_width() - 8.0)
+                .selected_text(self.outputs[current].name.clone())
+                .show_ui(ui, |ui| {
+                    for (i, d) in self.outputs.iter().enumerate() {
+                        ui.selectable_value(&mut pick, i, &d.name);
+                    }
+                });
+            if pick != current {
+                super::audio::set_default(&self.outputs[pick].id);
+                self.outputs = super::audio::devices(true);
+                self.vol = Volume::open();
+            }
         }
 
         // Brightness

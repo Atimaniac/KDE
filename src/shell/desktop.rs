@@ -592,6 +592,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // A device came or went (USB drives on the panel).
+        0x0219 /* WM_DEVICECHANGE */ => {
+            super::usb::CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
+            STATE.with(|s| {
+                if let Some(st) = s.borrow().as_ref() {
+                    st.ctx.request_repaint_after(std::time::Duration::from_millis(800));
+                }
+            });
+            1
+        }
         WM_CLOSE => 0, // the desktop is never closed by others
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }

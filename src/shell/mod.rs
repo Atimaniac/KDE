@@ -7,15 +7,20 @@
 //! * Starts your startup apps, owns Win+E / Win+D / Win+R / Alt+F1.
 //! * File-manager windows are separate `delfin.exe` processes.
 
+pub(crate) mod audio;
 mod desktop;
 pub mod install;
+mod kbd;
 mod media;
+mod notify;
 pub(crate) mod pins;
 pub(crate) mod quick;
 mod source;
+mod snap;
 mod startmenu;
 mod startup;
 mod tray;
+mod usb;
 pub(crate) mod win;
 
 use crate::config::Config;
@@ -47,8 +52,10 @@ const QUICK_W: f32 = 380.0;
 
 pub fn run() -> Result<(), eframe::Error> {
     if !win::single_instance("Local\\DelfinShell") {
+        shell_log("another shell is running: exit");
         return Ok(()); // already running in this session
     }
+    shell_log("started");
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title(PANEL_TITLE)
@@ -62,11 +69,28 @@ pub fn run() -> Result<(), eframe::Error> {
             .with_position([0.0, 0.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let r = eframe::run_native(
         PANEL_TITLE,
         options,
         Box::new(|cc| Ok(Box::new(ShellApp::new(cc)))),
-    )
+    );
+    shell_log(&format!("ended: {r:?}"));
+    r
+}
+
+/// One line in %LOCALAPPDATA%\delfin\shell.log: when the shell started and
+/// why it stopped (kept short).
+pub(crate) fn shell_log(what: &str) {
+    use std::io::Write;
+    let Some(dir) = dirs::data_local_dir().map(|d| d.join("delfin")) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("shell.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 64 * 1024) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} pid {}: {what}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), std::process::id());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +116,9 @@ enum PanelAction {
     /// Right-click on a window button.
     TaskMenu(isize, f32),
     ToggleCalendar,
+    ToggleNotifications,
+    LangMenu(f32),
+    UsbMenu(f32),
     Uri(&'static str),
     Tray(isize, u32, Click, f32),
     Unshelve(isize),
@@ -157,6 +184,24 @@ struct ShellApp {
     calendar_open: bool,
     calendar_seen_focus: bool,
     calendar_closed_at: Instant,
+    // app notifications (notify.rs)
+    notifier: notify::Notifier,
+    notif_open: bool,
+    notif_seen_focus: bool,
+    notif_closed_at: Instant,
+    /// Do not disturb: notifications only go to the centre.
+    dnd: bool,
+    /// The notification popped up now, and since when.
+    toast: Option<(notify::Toast, Instant)>,
+    toast_queue: std::collections::VecDeque<notify::Toast>,
+    notif_tex: HashMap<String, TextureHandle>,
+    /// Keyboard layouts (language indicator).
+    layouts: Vec<kbd::Layout>,
+    /// USB drives that can be ejected, and the drive letters they were read for.
+    usb_drives: Vec<usb::Drive>,
+    usb_mask: u32,
+    /// An eject running in the background: (what, result).
+    eject_rx: Option<std::sync::mpsc::Receiver<(String, Result<(), String>)>>,
     /// (year, month) shown in the calendar.
     calendar_month: (i32, u32),
     /// Last time we looked for a missing tray (Explorer closed after we started).
@@ -193,6 +238,8 @@ struct ShellApp {
     panel_menu: Option<PanelMenu>,
     /// Commands picked in menus inside other windows (launcher, desktop).
     menu_cmds: Vec<MenuCmd>,
+    /// The shell is ending on purpose (restart after an update).
+    quitting: bool,
     /// Windows whose blur (Aero) was set, and to what.
     aero_applied: HashMap<isize, bool>,
 }
@@ -229,6 +276,7 @@ impl ShellApp {
         let (tx, rx) = channel();
         win::spawn_hotkeys(tx, cc.egui_ctx.clone());
         win::spawn_window_events(cc.egui_ctx.clone());
+        kbd::watch(cc.egui_ctx.clone());
         let (desk_tx, desk_rx) = channel();
         desktop::start(desk_tx, cc.egui_ctx.clone(), cfg.dark);
         restore_leftover_shelved();
@@ -307,6 +355,18 @@ impl ShellApp {
             calendar_open: false,
             calendar_seen_focus: false,
             calendar_closed_at: long_ago,
+            notifier: notify::Notifier::start(cc.egui_ctx.clone()),
+            notif_open: false,
+            notif_seen_focus: false,
+            notif_closed_at: long_ago,
+            dnd: false,
+            toast: None,
+            toast_queue: std::collections::VecDeque::new(),
+            notif_tex: HashMap::new(),
+            layouts: kbd::layouts(),
+            usb_drives: usb::drives(),
+            usb_mask: 0,
+            eject_rx: None,
             calendar_month: (2000, 1),
             tray_checked: long_ago,
             preview: None,
@@ -329,6 +389,7 @@ impl ShellApp {
             exe_of_window: HashMap::new(),
             panel_menu: None,
             menu_cmds: Vec::new(),
+            quitting: false,
             aero_applied: HashMap::new(),
         };
         app
@@ -838,6 +899,7 @@ impl ShellApp {
                 win::run_hidden(&format!("ping -n 3 127.0.0.1 >nul & start \"\" \"{}\" --shell", exe.display()));
             }
             self.unshelve_all();
+            self.quitting = true;
             ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
         }
         if close {
@@ -1189,6 +1251,30 @@ impl ShellApp {
                         if c.secondary_clicked() {
                             actions.push(PanelAction::Uri("ms-settings:dateandtime"));
                         }
+                        // Notifications: a bell with how many are waiting.
+                        {
+                            let n = self.notifier.count();
+                            let (r, resp) = ui.allocate_exact_size(vec2(30.0, 36.0), Sense::click());
+                            let p = ui.painter();
+                            if self.notif_open {
+                                p.rect_filled(r, 4.0, pal.select);
+                            } else if resp.hovered() {
+                                p.rect_filled(r, 4.0, pal.hover);
+                            }
+                            paint_bell(p, Rect::from_center_size(r.center(), vec2(18.0, 18.0)), pal.text, self.dnd);
+                            if n > 0 {
+                                let b = pos2(r.right() - 8.0, r.top() + 9.0);
+                                p.circle_filled(b, 7.0, pal.accent);
+                                p.text(b, Align2::CENTER_CENTER, if n > 9 { "9+".to_string() } else { n.to_string() }, FontId::proportional(9.5), Color32::WHITE);
+                            }
+                            if resp.hovered() {
+                                let tip = if n == 0 { crate::i18n::tr("No new notifications").to_string() } else { crate::i18n::trf("Notifications: {}", &[&n]) };
+                                hovered = Some((tip, r.center().x));
+                            }
+                            if resp.clicked() {
+                                actions.push(PanelAction::ToggleNotifications);
+                            }
+                        }
                         // Volume and network: two separate buttons, each with its own
                         // flyout (layout is right-to-left, so volume is drawn first).
                         for section in [quick::Section::Sound, quick::Section::Network] {
@@ -1240,6 +1326,36 @@ impl ShellApp {
                                     quick::Section::Sound => "ms-settings:sound",
                                     quick::Section::Network => "ms-settings:network",
                                 }));
+                            }
+                        }
+                        // Keyboard language (only with more than one layout).
+                        if self.layouts.len() > 1 {
+                            if let Some(cur) = kbd::current() {
+                                let (r, resp) = ui.allocate_exact_size(vec2(32.0, 36.0), Sense::click());
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(r, 4.0, pal.hover);
+                                }
+                                ui.painter().text(r.center(), Align2::CENTER_CENTER, &cur.short, FontId::proportional(12.5), pal.text);
+                                if resp.hovered() {
+                                    hovered = Some((crate::i18n::trf("{}\nWin+Space switches", &[&cur.name]), r.center().x));
+                                }
+                                if resp.clicked() {
+                                    actions.push(PanelAction::LangMenu(r.left()));
+                                }
+                            }
+                        }
+                        // Safely remove hardware (only while a USB drive is in).
+                        if !self.usb_drives.is_empty() {
+                            let (r, resp) = ui.allocate_exact_size(vec2(28.0, 36.0), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, 4.0, pal.hover);
+                            }
+                            paint_usb(ui.painter(), Rect::from_center_size(r.center(), vec2(18.0, 18.0)), pal.text);
+                            if resp.hovered() {
+                                hovered = Some((crate::i18n::tr("Safely remove hardware").to_string(), r.center().x));
+                            }
+                            if resp.clicked() || resp.secondary_clicked() {
+                                actions.push(PanelAction::UsbMenu(r.left()));
                             }
                         }
                         // ---- notification area (layout is right-to-left, so iterate reversed)
@@ -1382,6 +1498,33 @@ impl ShellApp {
                     }
                 }
                 PanelAction::Media(c) => self.media.send(c),
+                PanelAction::LangMenu(x) => {
+                    let items = self.layouts.iter().map(|l| (format!("{}  ·  {}", l.short, l.name), MenuCmd::Layout(l.hkl))).collect();
+                    self.show_panel_menu(x, crate::i18n::tr("Keyboard layout").to_string(), items);
+                }
+                PanelAction::UsbMenu(x) => {
+                    let items = self
+                        .usb_drives
+                        .iter()
+                        .map(|d| {
+                            let name = if d.label.is_empty() { crate::i18n::tr("USB drive").to_string() } else { d.label.clone() };
+                            (crate::i18n::trf("Eject {} ({}:)", &[&name, &d.letter]), MenuCmd::Eject(d.devinst, format!("{name} ({}:)", d.letter)))
+                        })
+                        .collect();
+                    self.show_panel_menu(x, crate::i18n::tr("Safely remove hardware").to_string(), items);
+                }
+                PanelAction::ToggleNotifications => {
+                    if self.notif_open {
+                        self.notif_open = false;
+                        self.notif_closed_at = Instant::now();
+                    } else if self.notif_closed_at.elapsed() > Duration::from_millis(300) {
+                        self.open_quick(None);
+                        self.open_launcher(false);
+                        self.calendar_open = false;
+                        self.notif_open = true;
+                        self.notif_seen_focus = false;
+                    }
+                }
                 PanelAction::ToggleCalendar => {
                     if self.calendar_open {
                         self.calendar_open = false;
@@ -2106,6 +2249,245 @@ ui.ctx().request_repaint();
         self.aero_applied.retain(|h, on| *on && wins.contains(h));
     }
 
+    // ------------------------------------------------------------ notifications (see notify.rs)
+
+    /// Queue newly arrived notifications to pop up (not with Do not disturb,
+    /// nor while Explorer shows them itself).
+    fn notifications_tick(&mut self, ctx: &egui::Context) {
+        let fresh = self.notifier.take_fresh();
+        let explorer = win::EXPLORER_PRESENT.load(std::sync::atomic::Ordering::Relaxed);
+        if !self.dnd && !explorer {
+            self.toast_queue.extend(fresh);
+        }
+        if self.toast.as_ref().is_some_and(|(_, since)| since.elapsed() > Duration::from_secs(TOAST_SECS)) {
+            self.toast = None;
+        }
+        if self.toast.is_none() {
+            if let Some(t) = self.toast_queue.pop_front() {
+                self.toast = Some((t, Instant::now()));
+            }
+        }
+        if let Some((_, since)) = &self.toast {
+            ctx.request_repaint_after(Duration::from_secs(TOAST_SECS).saturating_sub(since.elapsed()) + Duration::from_millis(50));
+        }
+    }
+
+    fn notif_texture(&mut self, ctx: &egui::Context, t: &notify::Toast) -> Option<TextureHandle> {
+        if let Some(tex) = self.notif_tex.get(&t.aumid) {
+            return Some(tex.clone());
+        }
+        let icon = t.icon.as_ref()?;
+        let tex = ctx.load_texture(
+            format!("notif:{}", t.aumid),
+            egui::ColorImage::from_rgba_unmultiplied([icon.0, icon.1], &icon.2),
+            egui::TextureOptions::LINEAR,
+        );
+        self.notif_tex.insert(t.aumid.clone(), tex.clone());
+        Some(tex)
+    }
+
+    /// Bring up the app a notification came from (Windows can't tell us what
+    /// the notification itself would have opened), and drop the notification.
+    fn open_notification(&mut self, t: &notify::Toast) {
+        self.notifier.remove(t.id);
+        let candidates: Vec<source::Candidate> = self
+            .tasks
+            .iter()
+            .map(|w| source::Candidate {
+                hwnd: w.hwnd,
+                title: w.title.clone(),
+                exe: self.exe_of_window.get(&w.hwnd).cloned().flatten().unwrap_or_default(),
+            })
+            .collect();
+        if let Some(w) = source::player_windows(&t.aumid, "", candidates).first() {
+            win::switch_to(w.hwnd);
+        } else if t.aumid.contains('!') {
+            win::activate_packaged(&t.aumid);
+        }
+    }
+
+    /// One notification card. Returns (opened, dismissed).
+    fn notif_card(&mut self, ui: &mut Ui, ctx: &egui::Context, t: &notify::Toast, pal: &Palette, width: f32) -> (bool, bool) {
+        let body_lines = t.body.lines().count().clamp(0, 3) as f32;
+        let h = 58.0 + body_lines * 17.0;
+        let (r, resp) = ui.allocate_exact_size(vec2(width, h), Sense::click());
+        ui.painter().rect(r, 8.0, if resp.hovered() { pal.hover } else { pal.view }, Stroke::new(1.0_f32, pal.border));
+        let ir = Rect::from_min_size(r.min + vec2(12.0, 12.0), vec2(18.0, 18.0));
+        match self.notif_texture(ctx, t) {
+            Some(tex) => {
+                ui.painter().image(tex.id(), ir, uv_full(), Color32::WHITE);
+            }
+            None => {
+                ui.painter().circle_filled(ir.center(), 9.0, pal.accent);
+                let initial: String = t.app.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+                ui.painter().text(ir.center(), Align2::CENTER_CENTER, initial, FontId::proportional(11.0), Color32::WHITE);
+            }
+        }
+        let p = ui.painter().with_clip_rect(r.shrink(2.0));
+        p.text(pos2(ir.right() + 8.0, ir.center().y), Align2::LEFT_CENTER, &t.app, FontId::proportional(12.0), pal.dim);
+        p.text(pos2(r.right() - 34.0, ir.center().y), Align2::RIGHT_CENTER, notify::ago(t.time), FontId::proportional(11.5), pal.dim);
+        let text_w = r.width() - 24.0;
+        let title = label_wrapped(ui, &t.title, text_w, 14.0, pal.text, 1);
+        p.galley(pos2(r.left() + 12.0, r.top() + 36.0), title, pal.text);
+        if body_lines > 0.0 {
+            let body = label_wrapped(ui, &t.body, text_w, 13.0, pal.dim, 3);
+            p.galley(pos2(r.left() + 12.0, r.top() + 56.0), body, pal.dim);
+        }
+        // Dismiss (x)
+        let xr = Rect::from_center_size(pos2(r.right() - 16.0, ir.center().y), vec2(22.0, 22.0));
+        let xresp = ui.interact(xr, ui.id().with(("notif-x", t.id)), Sense::click());
+        if xresp.hovered() {
+            ui.painter().rect_filled(xr, 4.0, pal.hover);
+        }
+        icons::paint_tool(ui.painter(), xr, Tool::Close, pal.dim);
+        (resp.clicked() && !xresp.hovered(), xresp.clicked())
+    }
+
+    /// The notification centre above the bell.
+    fn notif_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        const W: f32 = 380.0;
+        const H: f32 = 540.0;
+        let screen = Self::screen_points(ctx);
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Notifications")
+            .with_transparent(true)
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([W, H])
+            .with_position([screen.x - W - 8.0, screen.y - self.lift - PANEL_H - H - 8.0]);
+        let mut close = false;
+        let mut open: Option<notify::Toast> = None;
+        let mut dismiss: Vec<u32> = Vec::new();
+        let mut clear = false;
+        let list = self.notifier.all();
+        let allowed = self.notifier.allowed();
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_notifications"), builder, |ctx, _| {
+            if !win::reveal_popup("Delfin Notifications", true) {
+                ctx.request_repaint();
+            }
+            let focused = ctx.input(|i| i.viewport().focused);
+            if focused == Some(true) {
+                self.notif_seen_focus = true;
+            }
+            if self.notif_seen_focus && focused == Some(false) {
+                close = true;
+            }
+            if !self.notif_seen_focus {
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested()) {
+                close = true;
+            }
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window).stroke(Stroke::new(1.0_f32, pal.border)).inner_margin(Margin::same(14.0)))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(crate::i18n::tr("Notifications")).size(16.0).strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if !list.is_empty() && ui.button(crate::i18n::tr("Clear all")).clicked() {
+                                clear = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let mut dnd = self.dnd;
+                        if quick::toggle(ui, &mut dnd, pal).changed() {
+                            self.dnd = dnd;
+                        }
+                        ui.label(crate::i18n::tr("Do not disturb"));
+                    });
+                    ui.add_space(8.0);
+                    let w = ui.available_width();
+                    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if !allowed {
+                            ui.label(RichText::new(crate::i18n::tr("Windows does not let Delfin read notifications. Allow it in Windows privacy settings (Notifications).")).color(pal.dim));
+                        } else if list.is_empty() {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new(crate::i18n::tr("No new notifications")).color(pal.dim));
+                            });
+                        }
+                        for t in &list {
+                            let (o, d) = self.notif_card(ui, ctx, t, pal, w - 8.0);
+                            if o {
+                                open = Some(t.clone());
+                            }
+                            if d {
+                                dismiss.push(t.id);
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
+                });
+        });
+        for id in dismiss {
+            self.notifier.remove(id);
+        }
+        if clear {
+            self.notifier.clear();
+        }
+        if let Some(t) = open {
+            self.open_notification(&t);
+            close = true;
+        }
+        if close {
+            self.notif_open = false;
+            self.notif_closed_at = Instant::now();
+        }
+    }
+
+    /// A new notification, popped up in the bottom-right corner for a few seconds.
+    fn toast_viewport(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some((t, _since)) = self.toast.clone() else { return };
+        const W: f32 = 364.0;
+        let h = 74.0 + t.body.lines().count().clamp(0, 3) as f32 * 17.0;
+        let screen = Self::screen_points(ctx);
+        let builder = ViewportBuilder::default()
+            .with_title("Delfin Toast")
+            .with_transparent(true)
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_active(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size([W, h])
+            .with_position([screen.x - W - 12.0, screen.y - self.lift - PANEL_H - h - 12.0]);
+        let mut open = false;
+        let mut dismiss = false;
+        let mut hovered = false;
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("delfin_toast"), builder, |ctx, _| {
+            // Never takes the focus from what you are doing.
+            if !win::reveal_popup("Delfin Toast", false) {
+                ctx.request_repaint();
+            }
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(pal.window).stroke(Stroke::new(1.0_f32, pal.border)).inner_margin(Margin::same(6.0)))
+                .show(ctx, |ui| {
+                    let w = ui.available_width();
+                    let (o, d) = self.notif_card(ui, ctx, &t, pal, w);
+                    open = o;
+                    dismiss = d;
+                    hovered = ui.rect_contains_pointer(ui.max_rect());
+                });
+        });
+        if open {
+            self.toast = None;
+            self.open_notification(&t);
+        } else if dismiss {
+            // Gone from the screen, still in the centre.
+            self.toast = None;
+        } else if hovered {
+            // Stays while the pointer rests on it.
+            self.toast = Some((t, Instant::now()));
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+    }
+
     // ------------------------------------------------------------ desktop
 
     /// Carry out what was picked on the desktop (see `desktop.rs`).
@@ -2142,6 +2524,12 @@ impl eframe::App for ShellApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The shell only ends when it decides to (update restart); a WM_CLOSE
+        // from elsewhere would otherwise take the whole desktop away.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            shell_log("close request ignored");
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        }
         if LOOK_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.reload_look(ctx);
         }
@@ -2195,6 +2583,40 @@ impl eframe::App for ShellApp {
                     }
                 }
                 win::Hotkey::SystemInfo => self.open_uri("ms-settings:about"),
+                win::Hotkey::Snap(d) => snap::key(d),
+                win::Hotkey::Settings => self.open_uri("ms-settings:"),
+                win::Hotkey::QuickSettings => {
+                    let open = self.quick_open.is_none();
+                    self.open_quick(open.then_some(quick::Section::Sound));
+                }
+                win::Hotkey::Notifications => {
+                    if self.notif_open {
+                        self.notif_open = false;
+                        self.notif_closed_at = Instant::now();
+                    } else {
+                        self.open_quick(None);
+                        self.open_launcher(false);
+                        self.calendar_open = false;
+                        self.notif_open = true;
+                        self.notif_seen_focus = false;
+                    }
+                }
+                win::Hotkey::PowerMenu => self.open_power_menu(),
+                win::Hotkey::Pin(i) => {
+                    if let Some(p) = self.pins.get(i).cloned() {
+                        // Like a click on the pin: switch to its window, or start it.
+                        let wins: Vec<isize> = self
+                            .tasks
+                            .iter()
+                            .filter(|t| self.exe_of_window.get(&t.hwnd).and_then(|e| e.as_deref()).is_some_and(|e| p.owns(e)))
+                            .map(|t| t.hwnd)
+                            .collect();
+                        match wins.first() {
+                            Some(&h) => win::switch_to(h),
+                            None => self.launch_pin(&p),
+                        }
+                    }
+                }
             }
         }
 
@@ -2212,6 +2634,12 @@ impl eframe::App for ShellApp {
         if let Some(section) = self.quick_open {
             self.quick_viewport(ctx, &pal, section);
         }
+        self.notifications_tick(ctx);
+        self.usb_tick();
+        if self.notif_open {
+            self.notif_viewport(ctx, &pal);
+        }
+        self.toast_viewport(ctx, &pal);
         if self.calendar_open {
             self.calendar_viewport(ctx, &pal);
         }
@@ -3311,6 +3739,14 @@ enum MenuCmd {
     /// The folder that holds a file, in Delfin.
     Location(PathBuf),
     CloseWindows(Vec<isize>),
+    /// Sign out, restart, shut down (Win+X).
+    Power(Power),
+    /// A program run as administrator (Win+X › Terminal (Admin)).
+    Admin(String),
+    /// Switch the keyboard layout of the app in front.
+    Layout(isize),
+    /// Prepare a USB drive for removal: (device node, its name).
+    Eject(u32, String),
 }
 
 struct PanelMenu {
@@ -3458,7 +3894,64 @@ impl ShellApp {
                     win::close(h);
                 }
             }
+            MenuCmd::Power(p) => self.power(p),
+            MenuCmd::Admin(exe) => {
+                crate::taskmgr::sys::run_elevated(&exe, "");
+            }
+            MenuCmd::Layout(hkl) => kbd::switch(hkl),
+            MenuCmd::Eject(devinst, name) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.eject_rx = Some(rx);
+                std::thread::spawn(move || {
+                    let _ = tx.send((name, usb::eject(devinst)));
+                });
+            }
         }
+    }
+
+    /// A USB drive came or went (or an eject finished): update the panel.
+    fn usb_tick(&mut self) {
+        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        if mask != self.usb_mask || usb::CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.usb_mask = mask;
+            self.usb_drives = usb::drives();
+            self.layouts = kbd::layouts();
+        }
+        if let Some(rx) = &self.eject_rx {
+            if let Ok((name, r)) = rx.try_recv() {
+                self.eject_rx = None;
+                let (title, body) = match r {
+                    Ok(()) => (crate::i18n::tr("Safe to remove hardware").to_string(), crate::i18n::trf("{} can now be removed.", &[&name])),
+                    Err(e) => (crate::i18n::trf("Can't eject {}", &[&name]), e),
+                };
+                self.toast_queue.push_back(notify::Toast { id: 0, app: "Delfin".into(), aumid: String::new(), title, body, time: chrono::Utc::now().timestamp(), icon: None });
+                self.usb_drives = usb::drives();
+            }
+        }
+    }
+
+    /// Win+X: the quick-link menu above the start button, like Windows'.
+    fn open_power_menu(&mut self) {
+        use crate::i18n::tr;
+        let cmd = |c: &str| MenuCmd::Launch(Launch::Cmd(c.to_string()));
+        let items = vec![
+            (tr("Installed apps").to_string(), cmd("ms-settings:appsfeatures")),
+            (tr("Power Options").to_string(), cmd("ms-settings:powersleep")),
+            (tr("System").to_string(), cmd("ms-settings:about")),
+            (tr("Device Manager").to_string(), cmd("devmgmt.msc")),
+            (tr("Network Connections").to_string(), cmd("ms-settings:network")),
+            (tr("Disk Management").to_string(), cmd("diskmgmt.msc")),
+            (tr("Computer Management").to_string(), cmd("compmgmt.msc")),
+            (tr("Terminal").to_string(), cmd("wt.exe")),
+            (tr("Terminal (Admin)").to_string(), MenuCmd::Admin("wt.exe".into())),
+            (tr("Task Manager").to_string(), cmd("taskmgr.exe")),
+            (tr("Settings").to_string(), cmd("ms-settings:")),
+            ("Delfin".to_string(), cmd("delfin")),
+            (tr("Sign out").to_string(), MenuCmd::Power(Power::Logout)),
+            (tr("Restart").to_string(), MenuCmd::Power(Power::Restart)),
+            (tr("Shut down").to_string(), MenuCmd::Power(Power::Shutdown)),
+        ];
+        self.show_panel_menu(4.0, "Delfin".to_string(), items);
     }
 
     /// A pinned app on the panel. `state`: 0 not running, 1 running, 2 in front.
@@ -3611,4 +4104,48 @@ fn paint_gloss(p: &egui::Painter, r: Rect, rounding: f32) {
         [pos2(r.left() + rounding, r.top() + 1.5), pos2(r.right() - rounding, r.top() + 1.5)],
         Stroke::new(1.0_f32, Color32::from_white_alpha(70)),
     );
+}
+
+/// How long a new notification stays on screen.
+const TOAST_SECS: u64 = 6;
+
+/// A bell (notifications); crossed out with Do not disturb.
+fn paint_bell(p: &egui::Painter, r: Rect, col: Color32, muted: bool) {
+    let c = r.center();
+    let s = r.width() / 18.0;
+    let st = Stroke::new(1.5_f32, col);
+    let v = |x: f32, y: f32| c + vec2(x * s, y * s);
+    let mut pts: Vec<egui::Pos2> = vec![v(-6.5, 5.0), v(-5.5, 3.5), v(-5.0, -1.5)];
+    for k in 0..=12 {
+        let a = std::f32::consts::PI * (1.0 + k as f32 / 12.0);
+        pts.push(c + vec2(a.cos() * 5.0 * s, -3.0 * s + a.sin() * 5.0 * s));
+    }
+    pts.extend([v(5.0, -1.5), v(5.5, 3.5), v(6.5, 5.0), v(-6.5, 5.0)]);
+    p.add(Shape::line(pts, st));
+    p.line_segment([v(-2.0, 7.0), v(2.0, 7.0)], st);
+    if muted {
+        p.line_segment([v(-8.0, -8.0), v(8.0, 8.0)], st);
+    }
+}
+
+/// Text wrapped to `width`, at most `rows` lines (ellipsis after).
+fn label_wrapped(ui: &Ui, text: &str, width: f32, size: f32, color: Color32, rows: usize) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat { font_id: FontId::proportional(size), color, ..Default::default() });
+    job.wrap = egui::text::TextWrapping { max_width: width, max_rows: rows, break_anywhere: false, overflow_character: Some('\u{2026}') };
+    ui.fonts(|f| f.layout_job(job))
+}
+
+/// The USB symbol (safely remove hardware).
+fn paint_usb(p: &egui::Painter, r: Rect, col: Color32) {
+    let c = r.center();
+    let s = r.width() / 18.0;
+    let st = Stroke::new(1.5_f32, col);
+    let v = |x: f32, y: f32| c + vec2(x * s, y * s);
+    p.line_segment([v(0.0, -7.5), v(0.0, 6.0)], st);
+    p.add(Shape::convex_polygon(vec![v(0.0, -9.0), v(-2.5, -5.5), v(2.5, -5.5)], col, Stroke::NONE));
+    p.circle_filled(v(0.0, 7.0), 2.0 * s, col);
+    p.add(Shape::line(vec![v(0.0, 3.0), v(-5.0, -0.5), v(-5.0, -3.5)], st));
+    p.circle_filled(v(-5.0, -4.5), 1.4 * s, col);
+    p.add(Shape::line(vec![v(0.0, 1.0), v(5.0, -2.0), v(5.0, -4.0)], st));
+    p.rect_filled(Rect::from_center_size(v(5.0, -5.0), vec2(2.8 * s, 2.8 * s)), 0.0, col);
 }

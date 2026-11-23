@@ -489,11 +489,25 @@ pub fn file_icon_rgba(path: &Path, large: bool) -> Option<(usize, usize, Vec<u8>
 // ----------------------------------------------------------------- process
 
 /// One copy of the shell per session.
+/// True when this is the only running shell. The mutex must be *owned*, not
+/// just exist: a shell that was killed (or is still going away) can leave
+/// the name behind for a moment, and two shells starting at once (ours and
+/// the one Windows restarts) must not both give up. So wait up to 4 s to own
+/// it; a live shell keeps it, a dead one's is abandoned and passes to us.
 pub fn single_instance(name: &str) -> bool {
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     let w = wide(name);
     unsafe {
         let h = CreateMutexW(null(), 1, w.as_ptr());
-        !h.is_null() && GetLastError() != 183 /* ERROR_ALREADY_EXISTS */
+        if h.is_null() {
+            return false;
+        }
+        if GetLastError() != 183 /* ERROR_ALREADY_EXISTS */ {
+            return true; // created it, so it is ours
+        }
+        // WAIT_OBJECT_0 or WAIT_ABANDONED: now ours. Timeout: a shell runs.
+        let r = WaitForSingleObject(h, 4000);
+        r == 0 || r == 0x80
     }
 }
 
@@ -626,6 +640,18 @@ pub enum Hotkey {
     TaskManager,
     /// Win+Pause: this PC's specification.
     SystemInfo,
+    /// Win+arrows: snap the window in front.
+    Snap(super::snap::Dir),
+    /// Win+I
+    Settings,
+    /// Win+A
+    QuickSettings,
+    /// Win+N
+    Notifications,
+    /// Win+X
+    PowerMenu,
+    /// Win+1 … Win+9 (0-based)
+    Pin(usize),
     /// Keyboard media keys: next, previous, play / pause, stop.
     Media(MediaKey),
     /// Keyboard volume keys (also volume knobs and sliders): +1 up, -1 down, 0 mute.
@@ -748,15 +774,27 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
         const MOD_ALT: u32 = 0x1;
         const MOD_WIN: u32 = 0x8;
         const NOREPEAT: u32 = 0x4000;
-        let keys: [(i32, u32, u32); 5] = [
+        let keys: [(i32, u32, u32); 13] = [
             (1, MOD_WIN | NOREPEAT, b'E' as u32), // Win+E  → file manager
             (2, MOD_ALT | NOREPEAT, 0x70),        // Alt+F1 → launcher (KDE default)
             (3, MOD_WIN | NOREPEAT, b'D' as u32), // Win+D  → show desktop
             (4, MOD_WIN | NOREPEAT, b'R' as u32), // Win+R  → launcher (run)
             (5, MOD_WIN | NOREPEAT, 0x13),        // Win+Pause → system specification
+            (6, MOD_WIN, 0x25),                   // Win+Left  → snap
+            (7, MOD_WIN, 0x27),                   // Win+Right → snap
+            (8, MOD_WIN, 0x26),                   // Win+Up    → snap / maximize
+            (9, MOD_WIN, 0x28),                   // Win+Down  → snap / restore / minimize
+            (10, MOD_WIN | NOREPEAT, b'I' as u32), // Win+I → Settings
+            (11, MOD_WIN | NOREPEAT, b'A' as u32), // Win+A → quick settings
+            (12, MOD_WIN | NOREPEAT, b'N' as u32), // Win+N → notifications
+            (13, MOD_WIN | NOREPEAT, b'X' as u32), // Win+X → system menu
         ];
         for (id, m, vk) in keys {
             RegisterHotKey(null_mut(), id, m, vk);
+        }
+        // Win+1 … Win+9: the pinned apps, in order.
+        for k in 0..9u32 {
+            RegisterHotKey(null_mut(), 14 + k as i32, MOD_WIN | NOREPEAT, b'1' as u32 + k);
         }
         // Keys from the hook go through a forwarding thread, which wakes the UI.
         let (fwd_tx, fwd_rx) = std::sync::mpsc::channel::<Hotkey>();
@@ -793,6 +831,15 @@ pub fn spawn_hotkeys(tx: Sender<Hotkey>, ctx: egui::Context) {
                     2 | 4 => Hotkey::Launcher,
                     3 => Hotkey::ShowDesktop,
                     5 => Hotkey::SystemInfo,
+                    6 => Hotkey::Snap(super::snap::Dir::Left),
+                    7 => Hotkey::Snap(super::snap::Dir::Right),
+                    8 => Hotkey::Snap(super::snap::Dir::Up),
+                    9 => Hotkey::Snap(super::snap::Dir::Down),
+                    10 => Hotkey::Settings,
+                    11 => Hotkey::QuickSettings,
+                    12 => Hotkey::Notifications,
+                    13 => Hotkey::PowerMenu,
+                    n @ 14..=22 => Hotkey::Pin(n - 14),
                     _ => continue,
                 };
                 let _ = tx.send(k);
@@ -827,11 +874,16 @@ pub fn spawn_window_events(ctx: egui::Context) {
                 (0x0016, 0x0017),       // EVENT_SYSTEM_MINIMIZESTART / END
                 (0x8000, 0x8003),       // EVENT_OBJECT_CREATE / DESTROY / SHOW / HIDE
                 (0x800B, 0x800C),       // EVENT_OBJECT_LOCATIONCHANGE / NAMECHANGE
+                (0x000A, 0x000B),       // EVENT_SYSTEM_MOVESIZESTART / END (snapping)
             ] {
                 SetWinEventHook(a, b, null_mut(), Some(win_event), 0, 0, OUTOFCONTEXT | SKIPOWNPROCESS);
             }
             let mut msg: MSG = std::mem::zeroed();
-            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}
+            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                // Dispatched: the snapping timer and preview window live on this thread.
+                windows_sys::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                windows_sys::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            }
         })
         .ok();
 }
@@ -845,6 +897,11 @@ unsafe extern "system" fn win_event(
     _thread: u32,
     _time: u32,
 ) {
+    // A window is being dragged or resized: snapping to screen edges.
+    if (event == 0x000A || event == 0x000B) && id_object == 0 {
+        super::snap::move_size(event, hwnd);
+        return;
+    }
     // Only whole windows, not carets, scroll bars or list items.
     if hwnd.is_null() || id_object != 0 || id_child != 0 {
         return;

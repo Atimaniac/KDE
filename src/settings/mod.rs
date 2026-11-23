@@ -427,6 +427,11 @@ struct Settings {
     hw_v: Option<sys::Hardware>,
     /// Displays for the report: "name	resolution".
     screens: Vec<String>,
+    /// Sound: devices and apps playing.
+    out_devs: Vec<crate::shell::audio::Device>,
+    in_devs: Vec<crate::shell::audio::Device>,
+    sessions: Vec<crate::shell::audio::Session>,
+    sessions_at: Instant,
     updater: crate::update::Updater,
     rename: Option<String>,
     armed: Option<(String, Instant)>,
@@ -501,6 +506,10 @@ impl Settings {
             hw: Arc::new(Mutex::new(None)),
             hw_v: None,
             screens: Vec::new(),
+            out_devs: Vec::new(),
+            in_devs: Vec::new(),
+            sessions: Vec::new(),
+            sessions_at: Instant::now(),
             updater: crate::update::Updater::default(),
             rename: None,
             armed: None,
@@ -577,7 +586,13 @@ impl Settings {
                 self.display = Some(DisplayState { monitors, sel, pending: None });
                 self.qp();
             }
-            Page::Sound => self.qp().refresh_volume(),
+            Page::Sound => {
+                self.qp().refresh_volume();
+                self.out_devs = crate::shell::audio::devices(true);
+                self.in_devs = crate::shell::audio::devices(false);
+                self.sessions = crate::shell::audio::sessions();
+                self.sessions_at = Instant::now();
+            }
             Page::Power => {
                 self.cached.battery = quick::battery();
                 self.plans = Some(sys::plans());
@@ -741,6 +756,13 @@ impl Settings {
 
     /// Pick up results from background threads.
     fn poll(&mut self, ctx: &egui::Context) {
+        // Apps that start or stop playing sound, and device changes.
+        if self.page == Page::Sound && self.sessions_at.elapsed() > Duration::from_secs(2) {
+            self.sessions = crate::shell::audio::sessions();
+            self.out_devs = crate::shell::audio::devices(true);
+            self.in_devs = crate::shell::audio::devices(false);
+            self.sessions_at = Instant::now();
+        }
         if let Some(a) = take(&self.about) {
             self.about_v = Some(a);
         }
@@ -894,6 +916,9 @@ impl eframe::App for Settings {
         // what changes by itself.
         let mut wake: Option<Duration> = None;
         let mut soon = |d: Duration| wake = Some(wake.map_or(d, |w| w.min(d)));
+        if self.page == Page::Sound {
+            soon(Duration::from_secs(2)); // apps start and stop playing
+        }
         if self.page == Page::Network {
             soon(Duration::from_secs(5)); // adapter details
         }
@@ -1781,17 +1806,71 @@ impl Settings {
                 row(ui, lk, Some(Ico::Speaker), tr("No output device found"), "", false);
             }
         }
-        if ext_row(ui, lk, Ico::Speaker, tr("Output devices"), tr("Choose where to play sound")) {
-            sys::start("rundll32.exe shell32.dll,Control_RunDLL mmsys.cpl,,0");
+        // Output and input devices: pick the default one here.
+        for (output, title, ico) in [(true, tr("Choose where to play sound"), Ico::Speaker), (false, tr("Choose a device for speaking or recording"), Ico::Mic)] {
+            if !output {
+                section(ui, tr("Input"));
+            }
+            let devs = if output { self.out_devs.clone() } else { self.in_devs.clone() };
+            if devs.is_empty() {
+                row(ui, lk, Some(ico), if output { tr("No output device found") } else { tr("No input device found") }, "", false);
+                continue;
+            }
+            let mut cur = devs.iter().position(|d| d.default).unwrap_or(0);
+            let items: Vec<(usize, String)> = devs.iter().enumerate().map(|(i, d)| (i, d.name.clone())).collect();
+            let mut changed = false;
+            row_with(ui, lk, Some(ico), title, "", false, 360.0, |ui| {
+                changed = combo(ui, if output { "outdev" } else { "indev" }, 340.0, &mut cur, &items);
+            });
+            if changed {
+                if let Some(d) = devs.get(cur) {
+                    if !crate::shell::audio::set_default(&d.id) {
+                        self.say(tr("The device could not be set as default."), true);
+                    }
+                }
+                self.out_devs = crate::shell::audio::devices(true);
+                self.in_devs = crate::shell::audio::devices(false);
+                self.qp().refresh_volume();
+            }
         }
-        section(ui, tr("Input"));
-        if ext_row(ui, lk, Ico::Mic, tr("Microphone"), tr("Input devices and levels")) {
-            sys::start("rundll32.exe shell32.dll,Control_RunDLL mmsys.cpl,,1");
-        }
-        section(ui, tr("Advanced"));
-        if ext_row(ui, lk, Ico::Sliders, tr("Volume mixer"), tr("App volume")) {
+
+        // Per-app volume (the volume mixer).
+        section(ui, tr("Volume mixer"));
+        let sessions = self.sessions.clone();
+        // Windows doesn't always let other programs change each app's volume;
+        // then its own mixer does it.
+        if sessions.is_empty() && ext_row(ui, lk, Ico::Sliders, tr("Volume mixer"), tr("App volume")) {
             sys::start("sndvol.exe");
         }
+        let ctx = ui.ctx().clone();
+        for s in &sessions {
+            let mut v = (s.volume * 100.0).round() as u32;
+            let mut changed = false;
+            let mut mute = false;
+            let tex = s.exe.as_ref().and_then(|p| self.file_icon(&ctx, p));
+            let resp = row_with(ui, lk, Some(if tex.is_some() { Ico::Blank } else { Ico::Speaker }), &s.name, "", false, 360.0, |ui| {
+                ui.label(format!("{v}"));
+                ui.spacing_mut().slider_width = 240.0;
+                changed = ui.add(egui::Slider::new(&mut v, 0..=100).show_value(false)).changed();
+                let (r, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 4.0, pal.hover);
+                }
+                quick::paint_speaker(ui.painter(), r.shrink(6.0), pal.text, if s.muted { None } else { Some(s.volume) });
+                mute = resp.on_hover_text(if s.muted { tr("Unmute") } else { tr("Mute") }).clicked();
+            });
+            if let Some(t) = tex {
+                let r = Rect::from_center_size(pos2(resp.rect.left() + 28.0, resp.rect.center().y), vec2(20.0, 20.0));
+                ui.painter().image(t, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            if changed || mute {
+                crate::shell::audio::set_session(s.pid, s.system, changed.then_some(v as f32 / 100.0), mute.then_some(!s.muted));
+                self.sessions = crate::shell::audio::sessions();
+                self.sessions_at = Instant::now();
+            }
+        }
+
+        section(ui, tr("Advanced"));
         if ext_row(ui, lk, Ico::Speaker, tr("More sound settings"), tr("Sounds, communications, device properties")) {
             sys::start("rundll32.exe shell32.dll,Control_RunDLL mmsys.cpl,,2");
         }
@@ -2751,6 +2830,19 @@ impl Settings {
             }
             None => {}
         }
+    }
+
+    /// A program's icon (cached by path).
+    fn file_icon(&mut self, ctx: &egui::Context, p: &std::path::Path) -> Option<egui::TextureId> {
+        let key = format!("file:{}", p.display());
+        if let Some(t) = self.app_icons.get(&key) {
+            return Some(t.id());
+        }
+        let (w, h, px) = crate::fileicons::icon_pixels(p, 0)?;
+        let t = ctx.load_texture(key.clone(), egui::ColorImage::from_rgba_unmultiplied([w, h], &px), egui::TextureOptions::LINEAR);
+        let id = t.id();
+        self.app_icons.insert(key, t);
+        Some(id)
     }
 
     fn app_icon(&mut self, ctx: &egui::Context, a: &sys::InstalledApp) -> Option<egui::TextureId> {
