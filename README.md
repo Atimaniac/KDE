@@ -24,7 +24,10 @@ Breeze Dark / Breeze Light look, written in Rust with egui.
   laptop screens), play / pause / next / previous and the battery level on laptops; the network
   button opens Wi-Fi on/off and a list of networks to connect to (with a password) or disconnect.
   Right-click either one for the matching Windows Settings page.
-- **Desktop**: your Windows wallpaper, Desktop folder icons (double-click to open), right-click menu.
+- **Desktop**: your Windows wallpaper, Desktop folder icons (double-click to open). Right-click an icon for
+  Open With…, Run as administrator, Cut / Copy, Paste Into Folder, Copy Location, archives, Create Shortcut,
+  Rename (F2), Trash and Properties; right-click the wallpaper for a new folder or text document and Paste.
+  Ctrl+C / Ctrl+X / Ctrl+V work there too.
 - **System tray** (notification area) (takes over as soon as Explorer is closed, also while the shell runs) that works like Explorer's: programs such as Steam,
   Discord or OneDrive show their icons, can hide to the tray when minimized, and get left / right /
   double / middle clicks and their context menus. Tooltips, balloon notifications and a **^**
@@ -126,6 +129,10 @@ Tip: install the **Noto Sans** font (KDE's font). Delfin uses it if it finds it.
 - **Information panel** (F11)
 - Filter-as-you-type (Ctrl+F)
 - Copy / Cut / Paste (runs in the background), Rename (F2), Move to Trash (Del), Delete permanently (Shift+Del), New Folder (Ctrl+Shift+N)
+- **Windows file clipboard**: files copied or cut in Delfin can be pasted in Explorer, on the desktop, in another Delfin window or in any program that takes files, and the other way round
+- **Right-click menu** of a file: Open With…, Run as administrator, Edit in Notepad, Set as Wallpaper, Paste Into Folder, Duplicate (Ctrl+D), Copy Location / Copy Name, Create Shortcut (here or on the desktop), archives, Pin to taskbar, Properties. Of the folder itself: Create New (folder, text document), Paste, View Mode, Sort By, Open in New Window, Properties
+- **Type to find**: typing letters jumps to the file whose name starts with them; the same letter again goes to the next one
+- Folders are read in the background: a slow one (network drive, sleeping disk) shows *Loading…* instead of freezing the window
 - Open Terminal Here (F4) → Windows Terminal, otherwise PowerShell
 - Hidden files toggle (Ctrl+H), sort by name/size/date/type, folders first
 - Mouse back/forward buttons work
@@ -147,6 +154,8 @@ Tip: install the **Noto Sans** font (KDE's font). Delfin uses it if it finds it.
 | Ctrl+T / Ctrl+W / Ctrl+PgUp/PgDn | New tab / Close tab / Switch tab |
 | Ctrl+L / Ctrl+F | Edit location / Filter |
 | Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V | Select all, copy, cut, paste |
+| Ctrl+D | Duplicate |
+| Letters | Jump to the file that starts with them |
 | Del / Shift+Del | Trash / Delete permanently |
 
 ## Project layout
@@ -155,5 +164,7 @@ Tip: install the **Noto Sans** font (KDE's font). Delfin uses it if it finds it.
 - `src/theme.rs`: Breeze colours and fonts
 - `src/icons.rs`: vector-painted Breeze-style icons
 - `src/fsops.rs`: listing, sorting, copy/move/delete
+- `src/shellops.rs`: file clipboard, Open With, Run as administrator, shortcuts, wallpaper
+- `src/renamebox.rs`: the small rename window the desktop uses
 - `src/platform.rs`: Windows drives, free space, terminal
 - `src/config.rs`: settings file

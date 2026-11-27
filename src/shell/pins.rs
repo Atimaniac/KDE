@@ -124,8 +124,20 @@ pub fn pin_path(name: &str, path: &Path) {
 
 /// Is this path pinned (for the file manager's menu)?
 pub fn is_pinned(path: &Path) -> bool {
-    let t = Launch::Path(path.to_path_buf());
-    load().iter().any(|p| p.same_target(&t))
+    // Only the file's own text is compared. Loading full pins opens every
+    // pinned shortcut to find its program, and a right-click must not wait
+    // for that.
+    let Some(text) = file().and_then(|f| std::fs::read_to_string(f).ok()) else {
+        return false;
+    };
+    let want = key(path);
+    text.lines().any(|l| {
+        let mut it = l.splitn(3, '\t');
+        match (it.next(), it.next(), it.next()) {
+            (Some("P"), Some(_), Some(val)) => key(Path::new(val)) == want,
+            _ => false,
+        }
+    })
 }
 
 pub fn unpin_path(path: &Path) {

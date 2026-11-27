@@ -17,6 +17,9 @@ mod icons;
 mod props;
 mod platform;
 #[cfg(windows)]
+mod renamebox;
+mod shellops;
+#[cfg(windows)]
 mod setup;
 #[cfg(windows)]
 mod settings;
@@ -57,6 +60,11 @@ fn main() -> Result<(), eframe::Error> {
         if let Some(i) = args.iter().position(|a| a == "--props") {
             if let Some(p) = args.get(i + 1) {
                 return props::run(std::path::PathBuf::from(p));
+            }
+        }
+        if let Some(i) = args.iter().position(|a| a == "--rename") {
+            if let Some(p) = args.get(i + 1) {
+                return renamebox::run(std::path::PathBuf::from(p));
             }
         }
         if has("--devmgr") {

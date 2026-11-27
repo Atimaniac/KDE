@@ -68,6 +68,12 @@ pub fn run() -> Result<(), eframe::Error> {
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size([1024.0, PANEL_H])
             .with_position([0.0, 0.0]),
+        // No waiting for the screen's refresh: the panel and each open pop-up
+        // (the volume display always exists) are separate surfaces drawn in
+        // the same frame, and each one would wait a full refresh in turn. Two
+        // surfaces halved the frame rate, three cut it to a third. Frames are
+        // paced by `pace_frames` instead.
+        vsync: false,
         ..Default::default()
     };
     let r = eframe::run_native(
@@ -77,6 +83,19 @@ pub fn run() -> Result<(), eframe::Error> {
     );
     shell_log(&format!("ended: {r:?}"));
     r
+}
+
+/// With vsync off nothing spaces the frames out: keep them at most 120 a
+/// second (an effect that redraws every frame would otherwise spin a core).
+fn pace_frames() {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(t) = *last {
+        if let Some(rest) = Duration::from_micros(8_300).checked_sub(t.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+    *last = Some(Instant::now());
 }
 
 /// One line in %LOCALAPPDATA%\delfin\shell.log: when the shell started and
@@ -2532,6 +2551,7 @@ impl eframe::App for ShellApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        pace_frames();
         // The shell only ends when it decides to (update restart); a WM_CLOSE
         // from elsewhere would otherwise take the whole desktop away.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {

@@ -399,17 +399,28 @@ unsafe fn menu(hwnd: HWND, i: Option<usize>) {
     let mut pinned = false;
     match &target {
         Some((p, dir, _)) => {
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             add(1, tr("Open"));
             if *dir {
                 add(3, tr("Open Terminal Here"));
             } else {
+                add(20, tr("Open With…"));
+                if crate::shellops::can_run_as_admin(&ext) {
+                    add(21, tr("Run as administrator"));
+                }
                 add(2, tr("Show in Delfin"));
             }
-            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             if !*dir && ["exe", "lnk", "url", "appref-ms"].contains(&ext.as_str()) {
                 pinned = super::pins::is_pinned(p);
                 add(4, if pinned { tr("Unpin from taskbar") } else { tr("Pin to taskbar") });
             }
+            sep();
+            add(22, tr("Cut"));
+            add(23, tr("Copy"));
+            if *dir && crate::shellops::has_files() {
+                add(24, tr("Paste Into Folder"));
+            }
+            add(25, tr("Copy Location"));
             sep();
             if crate::archive::is_archive(p) {
                 add(7, tr("Extract Here"));
@@ -421,11 +432,19 @@ unsafe fn menu(hwnd: HWND, i: Option<usize>) {
                 add(15, &crate::i18n::trf("Add to \"{}\"", &[&format!("{pack}.7z")]));
             }
             sep();
+            add(26, tr("Create Shortcut"));
+            add(27, tr("Rename…"));
             add(5, tr("Move to Trash"));
             sep();
             add(6, tr("Properties"));
         }
         None => {
+            add(30, tr("Create New Folder"));
+            add(31, tr("New Text Document"));
+            let w = wide(tr("Paste"));
+            let grey = if crate::shellops::has_files() { 0 } else { MF_GRAYED };
+            AppendMenuW(m, MF_STRING | grey, 32, w.as_ptr());
+            sep();
             add(10, tr("Open Desktop Folder"));
             add(11, tr("Open Terminal Here"));
             add(12, tr("Refresh"));
@@ -449,6 +468,36 @@ unsafe fn menu(hwnd: HWND, i: Option<usize>) {
         (5, Some((p, _, _))) => send(DeskAction::Trash(p)),
         (6, Some((p, _, _))) => send(DeskAction::Props(p)),
         (7 | 8 | 9 | 15, Some((p, _, _))) => archive_job(cmd, p),
+        (20, Some((p, _, _))) => crate::shellops::open_with(&p),
+        (21, Some((p, _, _))) => crate::shellops::run_as_admin(&p),
+        (22 | 23, Some((p, _, _))) => {
+            crate::shellops::set_files(&[p], cmd == 22);
+        }
+        (24, Some((p, _, _))) => paste_job(p),
+        (25, Some((p, _, _))) => {
+            crate::shellops::set_text(&p.display().to_string());
+        }
+        (26, Some((p, _, _))) => shortcut_job(p),
+        (27, Some((p, _, _))) => crate::shellops::rename_window(&p),
+        (30 | 31, _) => {
+            if let Some(d) = desktop {
+                let made = if cmd == 30 { crate::shellops::new_folder(&d) } else { crate::shellops::new_text_file(&d) };
+                match made {
+                    Ok(p) => {
+                        reload(true);
+                        InvalidateRect(hwnd, null(), 0);
+                        // Straight to its name, like in Windows.
+                        crate::shellops::rename_window(&p);
+                    }
+                    Err(e) => crate::platform::message("Delfin", &e.to_string()),
+                }
+            }
+        }
+        (32, _) => {
+            if let Some(d) = desktop {
+                paste_job(d);
+            }
+        }
         (10, _) => {
             if let Some(d) = desktop {
                 send(DeskAction::Open(d, true));
@@ -467,6 +516,31 @@ unsafe fn menu(hwnd: HWND, i: Option<usize>) {
         (14, _) => send(DeskAction::Uri("ms-settings:display")),
         _ => {}
     }
+}
+
+/// Paste the clipboard's files into `dest` in the background (cut files move).
+fn paste_job(dest: PathBuf) {
+    std::thread::spawn(move || {
+        let Some((paths, cut)) = crate::shellops::get_files() else { return };
+        if cut {
+            crate::shellops::clear_clipboard();
+        }
+        if let Err(e) = crate::fsops::paste(&paths, &dest, cut) {
+            crate::platform::message("Delfin", &crate::i18n::trf("Cannot paste: {}", &[&e]));
+        }
+        refresh();
+    });
+}
+
+/// A shortcut to a desktop item, next to it (PowerShell does it: not instant).
+fn shortcut_job(p: PathBuf) {
+    std::thread::spawn(move || {
+        let Some(dir) = p.parent().map(Path::to_path_buf) else { return };
+        if let Err(e) = crate::shellops::create_shortcut(&p, &dir) {
+            crate::platform::message("Delfin", &crate::i18n::trf("Cannot create shortcut: {}", &[&e]));
+        }
+        refresh();
+    });
 }
 
 /// Unpack (7 here, 8 into a folder) or pack (9 zip, 15 7z) a desktop item in the
@@ -593,6 +667,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0x74 /* F5 */ => {
                     reload(true);
                     InvalidateRect(hwnd, null(), 0);
+                }
+                0x71 /* F2 */ => {
+                    if let Some((p, _, _)) = sel().and_then(item) {
+                        crate::shellops::rename_window(&p);
+                    }
+                }
+                // Ctrl+C, Ctrl+X, Ctrl+V: the same file clipboard as everywhere else.
+                0x43 | 0x58 if crate::shellops::key_down(0x11) => {
+                    if let Some((p, _, _)) = sel().and_then(item) {
+                        crate::shellops::set_files(&[p], wp as u16 == 0x58);
+                    }
+                }
+                0x56 if crate::shellops::key_down(0x11) => {
+                    if let Some(d) = dirs::desktop_dir() {
+                        paste_job(d);
+                    }
                 }
                 0x1B /* Esc */ => set_sel(hwnd, None),
                 _ => {}

@@ -4,6 +4,7 @@ use crate::config::{Config, ViewMode};
 use crate::fsops::{self, Entry, SortBy};
 use crate::icons::{self, Tool};
 use crate::platform::{self, Drive};
+use crate::shellops;
 use crate::theme::{self, Palette};
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Layout, Margin, Modifiers, Rect,
@@ -12,8 +13,40 @@ use eframe::egui::{
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+/// For worker threads: wake the window when their result is ready.
+static REPAINT: OnceLock<egui::Context> = OnceLock::new();
+
+/// How long opening a folder may hold up the window. Nearly every folder is
+/// read faster than this and shows at once; a slow one (network drive, a disk
+/// waking up, tens of thousands of files) carries on in the background.
+const LOAD_WAIT: Duration = Duration::from_millis(40);
+
+/// A folder listing from the worker thread.
+struct Loaded {
+    seq: u64,
+    entries: Result<Vec<Entry>, String>,
+    space: Option<(u64, u64)>,
+}
+
+/// What a right-click menu is about. Worked out once when the menu opens:
+/// some of it reads files, and a menu is drawn again on every mouse move.
+#[derive(Clone)]
+struct ItemMenu {
+    path: PathBuf,
+    is_dir: bool,
+    ext: String,
+    /// Name a new archive would get.
+    pack: String,
+    /// How many items are selected.
+    count: usize,
+    archive: bool,
+    /// On the Delfin panel? `None` for files that can't be pinned.
+    pinned: Option<bool>,
+    can_paste: bool,
+}
 
 // =====================================================================
 // Pane = one folder view (a tab holds one, or two in split view)
@@ -36,10 +69,20 @@ pub struct Pane {
     scroll_offset: f32,
     viewport_h: f32,
     space: Option<(u64, u64)>,
+    load_tx: Sender<Loaded>,
+    load_rx: Receiver<Loaded>,
+    /// Number of the newest listing asked for; older answers are dropped.
+    load_seq: u64,
+    /// Since when the folder has been loading in the background.
+    loading: Option<Instant>,
+    /// Select this once the listing is in.
+    pending_select: Option<PathBuf>,
+    menu: Option<ItemMenu>,
 }
 
 impl Pane {
     fn new(dir: PathBuf, cfg: &Config) -> Self {
+        let (load_tx, load_rx) = channel();
         let mut p = Pane {
             cwd: dir.clone(),
             history: vec![dir],
@@ -56,26 +99,110 @@ impl Pane {
             scroll_offset: 0.0,
             viewport_h: 400.0,
             space: None,
+            load_tx,
+            load_rx,
+            load_seq: 0,
+            loading: None,
+            pending_select: None,
+            menu: None,
         };
-        p.reload(cfg);
+        p.load(cfg, true);
         p
     }
 
+    /// Read the folder again, keeping what is shown until the new listing is in.
     fn reload(&mut self, cfg: &Config) {
-        match fsops::list_dir(&self.cwd) {
+        self.load(cfg, false);
+    }
+
+    /// Read the folder on a worker thread. The window waits `LOAD_WAIT` for it;
+    /// after that the listing arrives through `poll`. `fresh`: another folder
+    /// than the one shown, so what is shown must go.
+    fn load(&mut self, cfg: &Config, fresh: bool) {
+        self.load_seq += 1;
+        let (seq, dir, tx) = (self.load_seq, self.cwd.clone(), self.load_tx.clone());
+        std::thread::spawn(move || {
+            let entries = fsops::list_dir(&dir).map_err(|e| e.to_string());
+            let space = platform::space(&dir);
+            let _ = tx.send(Loaded { seq, entries, space });
+            if let Some(ctx) = REPAINT.get() {
+                ctx.request_repaint();
+            }
+        });
+        let deadline = Instant::now() + LOAD_WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.load_rx.recv_timeout(left) {
+                Ok(l) if l.seq == self.load_seq => {
+                    self.take_loaded(l, cfg);
+                    return;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        if fresh {
+            self.entries.clear();
+            self.visible.clear();
+            self.error = None;
+            self.space = None;
+        }
+        if self.loading.is_none() {
+            self.loading = Some(Instant::now());
+        }
+    }
+
+    /// Take a listing that finished in the background.
+    fn poll(&mut self, cfg: &Config) {
+        let mut newest = None;
+        while let Ok(l) = self.load_rx.try_recv() {
+            if l.seq == self.load_seq {
+                newest = Some(l);
+            }
+        }
+        if let Some(l) = newest {
+            self.take_loaded(l, cfg);
+        }
+    }
+
+    fn take_loaded(&mut self, l: Loaded, cfg: &Config) {
+        self.loading = None;
+        match l.entries {
             Ok(v) => {
                 self.entries = v;
                 self.error = None;
             }
             Err(e) => {
                 self.entries.clear();
-                self.error = Some(e.to_string());
+                self.error = Some(e);
             }
         }
-        self.space = platform::space(&self.cwd);
+        self.space = l.space;
         self.refilter(cfg);
         let existing: HashSet<&PathBuf> = self.entries.iter().map(|e| &e.path).collect();
         self.selected.retain(|p| existing.contains(p));
+        if let Some(p) = self.pending_select.take() {
+            self.select_path(&p);
+        }
+    }
+
+    /// Select one item and scroll to it; false if it isn't listed.
+    fn select_path(&mut self, p: &Path) -> bool {
+        match self.vis_index_of(p) {
+            Some(i) => {
+                self.select_only(i);
+                self.scroll_to = Some(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Select an item now, or as soon as the folder's listing is in.
+    fn select_when_loaded(&mut self, p: &Path) {
+        if !self.select_path(p) && self.loading.is_some() {
+            self.pending_select = Some(p.to_path_buf());
+        }
     }
 
     fn refilter(&mut self, cfg: &Config) {
@@ -122,7 +249,9 @@ impl Pane {
         self.anchor = None;
         self.cursor = None;
         self.scroll_to = Some(0);
-        self.reload(cfg);
+        self.pending_select = None;
+        self.menu = None;
+        self.load(cfg, true);
     }
 
     fn navigate(&mut self, p: PathBuf, cfg: &Config) {
@@ -135,10 +264,7 @@ impl Pane {
         self.hist_pos = self.history.len() - 1;
         self.go(p, cfg);
         // Going up: highlight the folder we came from, like Dolphin.
-        if let Some(i) = self.vis_index_of(&prev) {
-            self.select_only(i);
-            self.scroll_to = Some(i);
-        }
+        self.select_when_loaded(&prev);
     }
 
     fn can_back(&self) -> bool {
@@ -291,6 +417,23 @@ enum Action {
     /// Pack the selection into an archive of this type ("zip", "7z").
     Compress(&'static str),
     OpenIn7Zip(PathBuf),
+    OpenWith(PathBuf),
+    RunAsAdmin(PathBuf),
+    /// Open a text file in Notepad.
+    EditText(PathBuf),
+    NewWindow(PathBuf),
+    /// Paste the clipboard's files into this folder.
+    PasteInto(PathBuf),
+    Duplicate,
+    CopyName,
+    /// A shortcut to each selected item: on the desktop (true) or right here.
+    Shortcut(bool),
+    Wallpaper(PathBuf),
+    NewTextFile,
+    View(ViewMode),
+    /// Sort by this column, in this direction.
+    SortBy(SortBy, bool),
+    Props(PathBuf),
 }
 
 #[derive(Default)]
@@ -323,6 +466,13 @@ pub struct App {
     loc_focus: bool,
     search_focus: bool,
     title: String,
+    /// When files were last pasted (one Ctrl+V can reach us twice).
+    last_paste: Instant,
+    /// Were Ctrl and V both down on the last frame?
+    paste_keys: bool,
+    /// Letters typed to jump to a file, and when the last one came.
+    typed: String,
+    typed_at: Instant,
 }
 
 fn default_places() -> Vec<(&'static str, PathBuf)> {
@@ -389,7 +539,9 @@ impl App {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         let (tx, rx) = channel();
+        let _ = REPAINT.set(cc.egui_ctx.clone());
         let pane = Pane::new(start, &cfg);
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now);
 
         Self {
             saved_cfg: cfg.clone(),
@@ -412,6 +564,10 @@ impl App {
             loc_focus: false,
             search_focus: false,
             title: String::new(),
+            last_paste: long_ago,
+            paste_keys: false,
+            typed: String::new(),
+            typed_at: long_ago,
         }
     }
 
@@ -487,12 +643,7 @@ impl App {
     }
 
     fn select_path(&mut self, p: &Path) {
-        self.with_pane(|pane, _| {
-            if let Some(i) = pane.vis_index_of(p) {
-                pane.select_only(i);
-                pane.scroll_to = Some(i);
-            }
-        });
+        self.with_pane(|pane, _| pane.select_when_loaded(p));
     }
 
     fn spawn(&mut self, ctx: &egui::Context, f: impl FnOnce() -> JobResult + Send + 'static) {
@@ -523,14 +674,59 @@ impl App {
     }
 
     fn paste(&mut self, ctx: &egui::Context) {
-        let Some(clip) = self.clip.clone() else {
-            return;
-        };
         let dest = self.pane().cwd.clone();
-        if clip.cut {
-            self.clip = None;
+        self.paste_into(ctx, dest);
+    }
+
+    /// Paste the files on the Windows clipboard (from Delfin, the desktop,
+    /// Explorer or any other program) into `dest`; cut files are moved.
+    fn paste_into(&mut self, ctx: &egui::Context, dest: PathBuf) {
+        // One Ctrl+V can arrive both as a paste event and as a key press.
+        if self.last_paste.elapsed() < Duration::from_millis(400) {
+            return;
         }
-        self.spawn(ctx, move || fsops::paste(&clip.paths, &dest, clip.cut));
+        let (paths, cut) = match shellops::get_files() {
+            Some(files) => files,
+            None => match self.clip.clone() {
+                Some(c) => (c.paths, c.cut),
+                None => return,
+            },
+        };
+        self.last_paste = Instant::now();
+        if cut {
+            self.clip = None;
+            shellops::clear_clipboard();
+        }
+        self.spawn(ctx, move || fsops::paste(&paths, &dest, cut));
+    }
+
+    /// Jump to the first item whose name starts with what was just typed.
+    fn type_ahead(&mut self, text: &str) {
+        if self.typed_at.elapsed() > Duration::from_millis(1000) {
+            self.typed.clear();
+        }
+        self.typed_at = Instant::now();
+        self.typed.push_str(&text.to_lowercase());
+        let typed = self.typed.clone();
+        self.with_pane(|p, _| {
+            let n = p.visible.len();
+            if n == 0 {
+                return;
+            }
+            // The same letter again and again steps through the items that start with it.
+            let mut chars = typed.chars();
+            let first = chars.next();
+            let repeated = typed.chars().count() > 1 && chars.all(|c| Some(c) == first);
+            let (prefix, start) = match (repeated, first) {
+                (true, Some(c)) => (c.to_string(), p.cursor.map_or(0, |c| c + 1)),
+                _ => (typed.clone(), 0),
+            };
+            let hit = (0..n).map(|k| (start + k) % n).find(|&i| p.ent(i).name.to_lowercase().starts_with(&prefix));
+            if let Some(i) = hit {
+                p.select_only(i);
+                p.scroll_to = Some(i);
+            }
+        });
     }
 
     fn go_to_typed(&mut self, typed: &str) {
@@ -589,13 +785,16 @@ impl App {
                 if paths.is_empty() {
                     return;
                 }
-                // Also put paths on the system clipboard as text.
-                let text = paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                ctx.output_mut(|o| o.copied_text = text);
+                // On the Windows clipboard as files (for Explorer, the desktop and
+                // other Delfin windows) and as text; elsewhere as text only.
+                if !shellops::set_files(&paths, cut) {
+                    let text = paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ctx.output_mut(|o| o.copied_text = text);
+                }
                 let n = paths.len();
                 self.clip = Some(Clip { paths, cut });
                 self.info(format!(
@@ -605,7 +804,7 @@ impl App {
             }
             Action::Paste => self.paste(ctx),
             Action::PasteText(text) => {
-                if self.clip.is_some() {
+                if self.clip.is_some() || shellops::has_files() {
                     self.paste(ctx);
                 } else {
                     // Paths copied from elsewhere (e.g. Explorer's "Copy as path").
@@ -706,6 +905,66 @@ impl App {
                 Ok(()) => self.info(crate::i18n::tr("Folders open in Windows Explorer again")),
                 Err(e) => self.err(e),
             },
+            Action::OpenWith(p) => shellops::open_with(&p),
+            Action::RunAsAdmin(p) => shellops::run_as_admin(&p),
+            Action::EditText(p) => {
+                if let Err(e) = std::process::Command::new("notepad.exe").arg(&p).spawn() {
+                    self.err(crate::i18n::trf("Cannot open {}: {}", &[&p.display(), &e]));
+                }
+            }
+            Action::NewWindow(p) => shellops::new_window(&p),
+            Action::PasteInto(dir) => self.paste_into(ctx, dir),
+            Action::Duplicate => {
+                let paths = self.pane().selected_paths();
+                if !paths.is_empty() {
+                    self.spawn(ctx, move || shellops::duplicate(&paths));
+                }
+            }
+            Action::CopyName => {
+                let names: Vec<String> = self.pane().selected_paths().iter().map(|p| display_name(p)).collect();
+                if !names.is_empty() {
+                    ctx.output_mut(|o| o.copied_text = names.join("\n"));
+                    self.info(crate::i18n::tr("Name copied"));
+                }
+            }
+            Action::Shortcut(on_desktop) => {
+                let paths = self.pane().selected_paths();
+                let dir = if on_desktop { dirs::desktop_dir() } else { Some(self.pane().cwd.clone()) };
+                if let (false, Some(dir)) = (paths.is_empty(), dir) {
+                    self.spawn(ctx, move || {
+                        for p in &paths {
+                            shellops::create_shortcut(p, &dir).map_err(|e| crate::i18n::trf("Cannot create shortcut: {}", &[&e]))?;
+                        }
+                        Ok(crate::i18n::tr("Shortcut created").to_string())
+                    });
+                }
+            }
+            Action::Wallpaper(p) => {
+                if shellops::set_wallpaper(&p) {
+                    self.info(crate::i18n::tr("Wallpaper changed"));
+                } else {
+                    self.err(crate::i18n::tr("The wallpaper could not be changed"));
+                }
+            }
+            Action::NewTextFile => {
+                let dir = self.pane().cwd.clone();
+                match shellops::new_text_file(&dir) {
+                    Ok(path) => {
+                        self.reload_all();
+                        self.select_path(&path);
+                        // Straight to its name, like in Windows.
+                        self.dialog = Dialog::Rename { text: display_name(&path), path, focus: true };
+                    }
+                    Err(e) => self.err(crate::i18n::trf("Cannot create file: {}", &[&e])),
+                }
+            }
+            Action::View(v) => self.cfg.view = v,
+            Action::SortBy(k, asc) => {
+                self.cfg.sort = k;
+                self.cfg.sort_asc = asc;
+                self.refilter_all();
+            }
+            Action::Props(p) => shellops::properties(&p),
             Action::SelectAll => self.with_pane(|p, _| {
                 p.selected = p
                     .visible
@@ -784,6 +1043,11 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Ctrl+V pressed just now? egui only reports a paste when the clipboard
+        // holds text; files copied in Explorer come without any.
+        let keys = shellops::key_down(0x11) && shellops::key_down(0x56);
+        let paste_pressed = keys && !self.paste_keys && ctx.input(|i| i.focused);
+        self.paste_keys = keys;
         if !matches!(self.dialog, Dialog::None) {
             return;
         }
@@ -854,6 +1118,9 @@ impl App {
         }
         if ck(CTRL, Key::A) {
             acts.push(Action::SelectAll);
+        }
+        if ck(CTRL, Key::D) {
+            acts.push(Action::Duplicate);
         }
         if ck(CTRL, Key::Num1) {
             self.cfg.view = ViewMode::Icons;
@@ -937,13 +1204,27 @@ impl App {
 
         // egui turns Ctrl+C / X / V into these events instead of key presses.
         let events = ctx.input(|i| i.events.clone());
+        let mut pasted = false;
+        let mut typed = String::new();
         for ev in events {
             match ev {
                 egui::Event::Copy => acts.push(Action::Copy),
                 egui::Event::Cut => acts.push(Action::Cut),
-                egui::Event::Paste(t) => acts.push(Action::PasteText(t)),
+                egui::Event::Paste(t) => {
+                    pasted = true;
+                    acts.push(Action::PasteText(t));
+                }
+                egui::Event::Text(t) => typed.push_str(&t),
                 _ => {}
             }
+        }
+        if paste_pressed && !pasted && shellops::has_files() {
+            acts.push(Action::Paste);
+        }
+        // Typing letters jumps to the file that starts with them.
+        let plain = ctx.input(|i| !i.modifiers.command && !i.modifiers.alt);
+        if plain && !typed.trim().is_empty() {
+            self.type_ahead(&typed);
         }
 
         for a in acts {
@@ -1557,7 +1838,21 @@ impl App {
             Some(c) if c.cut => c.paths.clone(),
             _ => Vec::new(),
         };
-        let can_paste = self.clip.is_some();
+        // "Cut" items stay dimmed only while they are still on the clipboard.
+        if cfg!(windows) && self.clip.is_some() && !shellops::has_files() {
+            self.clip = None;
+        }
+        let can_paste = self.clip.is_some() || shellops::has_files();
+        {
+            let cfg = &self.cfg;
+            for pane in &mut self.tabs[self.cur].panes {
+                pane.poll(cfg);
+                // Show "Loading…" only once a folder really takes a while.
+                if pane.loading.is_some() {
+                    ctx.request_repaint_after(Duration::from_millis(150));
+                }
+            }
+        }
         let mut outs: Vec<(usize, PaneOut)> = Vec::new();
 
         egui::CentralPanel::default()
@@ -2042,144 +2337,235 @@ fn mi(ui: &mut Ui, label: &str, shortcut: &str) -> bool {
     clicked
 }
 
-/// Archive entries: unpack archives, pack anything. `pack` is the name the new archive gets.
+/// A submenu's entry: a radio button that closes the menu when picked.
+fn radio_item(ui: &mut Ui, on: bool, label: &str) -> bool {
+    let clicked = ui.radio(on, label).clicked();
+    if clicked {
+        ui.close_menu();
+    }
+    clicked
+}
+
+/// Archive entries: unpack archives, pack anything.
 #[cfg(windows)]
-fn archive_menu(ui: &mut Ui, path: &Path, pack: &str, out: &mut PaneOut) {
+fn archive_menu(ui: &mut Ui, m: &ItemMenu, out: &mut PaneOut) {
     use crate::archive;
     use crate::i18n::{tr, trf};
     let seven = archive::seven_zip().is_some();
     ui.separator();
-    if archive::is_archive(path) {
+    if m.archive {
         if mi(ui, tr("Extract Here"), "") {
             out.actions.push(Action::Extract(true));
         }
-        if mi(ui, &trf("Extract to \"{}\\\"", &[&archive::base_name(path)]), "") {
+        if mi(ui, &trf("Extract to \"{}\\\"", &[&archive::base_name(&m.path)]), "") {
             out.actions.push(Action::Extract(false));
         }
         if seven && mi(ui, tr("Open in 7-Zip"), "") {
-            out.actions.push(Action::OpenIn7Zip(path.to_path_buf()));
+            out.actions.push(Action::OpenIn7Zip(m.path.clone()));
         }
     }
-    if mi(ui, &trf("Add to \"{}\"", &[&format!("{pack}.zip")]), "") {
+    if mi(ui, &trf("Add to \"{}\"", &[&format!("{}.zip", m.pack)]), "") {
         out.actions.push(Action::Compress("zip"));
     }
-    if seven && mi(ui, &trf("Add to \"{}\"", &[&format!("{pack}.7z")]), "") {
+    if seven && mi(ui, &trf("Add to \"{}\"", &[&format!("{}.7z", m.pack)]), "") {
         out.actions.push(Action::Compress("7z"));
     }
 }
 
-fn item_menu(ui: &mut Ui, path: &Path, is_dir: bool, pack: &str, out: &mut PaneOut) {
-    ui.set_min_width(230.0);
-    if mi(ui, crate::i18n::tr("Open"), "Enter") {
+/// The right-click menu of a file or folder (or of the whole selection).
+fn item_menu(ui: &mut Ui, m: &ItemMenu, out: &mut PaneOut) {
+    use crate::i18n::tr;
+    ui.set_min_width(250.0);
+    let one = m.count <= 1;
+    let path = &m.path;
+    if mi(ui, tr("Open"), "Enter") {
         out.actions.push(Action::OpenSelected);
     }
-    if is_dir {
-        if mi(ui, crate::i18n::tr("Open in New Tab"), crate::i18n::tr("Middle click")) {
-            out.actions.push(Action::NewTab(path.to_path_buf()));
+    if m.is_dir && one {
+        if mi(ui, tr("Open in New Tab"), tr("Middle click")) {
+            out.actions.push(Action::NewTab(path.clone()));
         }
-        if mi(ui, crate::i18n::tr("Open Terminal Here"), "") {
-            out.actions.push(Action::Terminal(path.to_path_buf()));
+        if mi(ui, tr("Open in New Window"), "") {
+            out.actions.push(Action::NewWindow(path.clone()));
+        }
+        if mi(ui, tr("Open Terminal Here"), "") {
+            out.actions.push(Action::Terminal(path.clone()));
+        }
+    }
+    if !m.is_dir && one && cfg!(windows) {
+        if mi(ui, tr("Open With…"), "") {
+            out.actions.push(Action::OpenWith(path.clone()));
+        }
+        if shellops::can_run_as_admin(&m.ext) && mi(ui, tr("Run as administrator"), "") {
+            out.actions.push(Action::RunAsAdmin(path.clone()));
+        }
+        if shellops::is_text(&m.ext) && mi(ui, tr("Edit in Notepad"), "") {
+            out.actions.push(Action::EditText(path.clone()));
+        }
+        if shellops::can_be_wallpaper(&m.ext) && mi(ui, tr("Set as Wallpaper"), "") {
+            out.actions.push(Action::Wallpaper(path.clone()));
         }
     }
     ui.separator();
-    if mi(ui, crate::i18n::tr("Cut"), "Ctrl+X") {
+    if mi(ui, tr("Cut"), "Ctrl+X") {
         out.actions.push(Action::Cut);
     }
-    if mi(ui, crate::i18n::tr("Copy"), "Ctrl+C") {
+    if mi(ui, tr("Copy"), "Ctrl+C") {
         out.actions.push(Action::Copy);
     }
-    if mi(ui, crate::i18n::tr("Copy Location"), "") {
-        out.actions.push(Action::CopyPath);
+    if m.is_dir && one && m.can_paste && mi(ui, tr("Paste Into Folder"), "") {
+        out.actions.push(Action::PasteInto(path.clone()));
     }
+    if mi(ui, tr("Duplicate"), "Ctrl+D") {
+        out.actions.push(Action::Duplicate);
+    }
+    ui.menu_button(tr("Copy to Clipboard"), |ui| {
+        if mi(ui, tr("Copy Location"), "") {
+            out.actions.push(Action::CopyPath);
+        }
+        if mi(ui, tr("Copy Name"), "") {
+            out.actions.push(Action::CopyName);
+        }
+    });
     #[cfg(windows)]
-    archive_menu(ui, path, pack, out);
-    #[cfg(not(windows))]
-    let _ = pack;
+    archive_menu(ui, m, out);
     ui.separator();
-    if mi(ui, crate::i18n::tr("Rename…"), "F2") {
+    if one && mi(ui, tr("Rename…"), "F2") {
         out.actions.push(Action::Rename);
     }
-    if mi(ui, crate::i18n::tr("Move to Trash"), "Del") {
+    if mi(ui, tr("Move to Trash"), "Del") {
         out.actions.push(Action::Trash);
     }
-    if mi(ui, crate::i18n::tr("Delete"), "Shift+Del") {
+    if mi(ui, tr("Delete"), "Shift+Del") {
         out.actions.push(Action::Delete);
     }
     ui.separator();
-    if is_dir && mi(ui, crate::i18n::tr("Add to Places"), "") {
-        out.actions.push(Action::AddPlace(path.to_path_buf()));
+    if cfg!(windows) {
+        ui.menu_button(tr("Create Shortcut"), |ui| {
+            if mi(ui, tr("On the Desktop"), "") {
+                out.actions.push(Action::Shortcut(true));
+            }
+            if mi(ui, tr("Here"), "") {
+                out.actions.push(Action::Shortcut(false));
+            }
+        });
+    }
+    if m.is_dir && one && mi(ui, tr("Add to Places"), "") {
+        out.actions.push(Action::AddPlace(path.clone()));
     }
     #[cfg(windows)]
-    {
+    if let (true, Some(pinned)) = (one, m.pinned) {
         // Programs and shortcuts can go on the Delfin panel.
-        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if !is_dir && ["exe", "lnk", "url", "appref-ms"].contains(&ext.as_str()) {
-            use crate::shell::pins;
-            if pins::is_pinned(path) {
-                if mi(ui, crate::i18n::tr("Unpin from taskbar"), "") {
-                    pins::unpin_path(path);
-                    ui.close_menu();
-                }
-            } else if mi(ui, crate::i18n::tr("Pin to taskbar"), "") {
-                let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                pins::pin_path(&name, path);
-                ui.close_menu();
+        use crate::shell::pins;
+        if pinned {
+            if mi(ui, tr("Unpin from taskbar"), "") {
+                pins::unpin_path(path);
             }
+        } else if mi(ui, tr("Pin to taskbar"), "") {
+            let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            pins::pin_path(&name, path);
         }
     }
-    if mi(ui, crate::i18n::tr("Information Panel"), "F11") {
+    if mi(ui, tr("Information Panel"), "F11") {
         out.actions.push(Action::ShowInfo);
     }
-    #[cfg(windows)]
-    if mi(ui, crate::i18n::tr("Properties"), "Alt+Enter") {
-        if let Ok(exe) = std::env::current_exe() {
-            let _ = std::process::Command::new(exe).arg("--props").arg(path).spawn();
-        }
-        ui.close_menu();
+    if cfg!(windows) && one && mi(ui, tr("Properties"), "Alt+Enter") {
+        out.actions.push(Action::Props(path.clone()));
     }
 }
 
+/// The right-click menu of the folder itself (empty space between the items).
 fn background_menu(ui: &mut Ui, cwd: &Path, cfg: &Config, can_paste: bool, out: &mut PaneOut) {
-    ui.set_min_width(230.0);
-    if mi(ui, crate::i18n::tr("Create New Folder…"), "Ctrl+Shift+N") {
-        out.actions.push(Action::NewFolder);
-    }
-    if ui
-        .add_enabled(
-            can_paste,
-            egui::Button::new(crate::i18n::tr("Paste")).shortcut_text("Ctrl+V"),
-        )
-        .clicked()
-    {
+    use crate::i18n::tr;
+    ui.set_min_width(250.0);
+    ui.menu_button(tr("Create New"), |ui| {
+        if mi(ui, tr("Folder…"), "Ctrl+Shift+N") {
+            out.actions.push(Action::NewFolder);
+        }
+        if mi(ui, tr("Text Document"), "") {
+            out.actions.push(Action::NewTextFile);
+        }
+    });
+    if ui.add_enabled(can_paste, egui::Button::new(tr("Paste")).shortcut_text("Ctrl+V")).clicked() {
         out.actions.push(Action::Paste);
         ui.close_menu();
     }
     ui.separator();
-    if mi(ui, crate::i18n::tr("Open Terminal Here"), "F4") {
-        out.actions.push(Action::Terminal(cwd.to_path_buf()));
-    }
-    if mi(ui, crate::i18n::tr("Copy Location"), "") {
-        out.actions.push(Action::CopyPath);
-    }
-    if mi(ui, crate::i18n::tr("Add to Places"), "") {
-        out.actions.push(Action::AddPlace(cwd.to_path_buf()));
-    }
-    ui.separator();
+    ui.menu_button(tr("View Mode"), |ui| {
+        for (mode, label) in [(ViewMode::Icons, "Icons"), (ViewMode::Compact, "Compact"), (ViewMode::Details, "Details")] {
+            if radio_item(ui, cfg.view == mode, tr(label)) {
+                out.actions.push(Action::View(mode));
+            }
+        }
+    });
+    ui.menu_button(tr("Sort By"), |ui| {
+        for (key, label) in [(SortBy::Name, "Name"), (SortBy::Size, "Size"), (SortBy::Modified, "Modified"), (SortBy::Type, "Type")] {
+            if radio_item(ui, cfg.sort == key, tr(label)) {
+                out.actions.push(Action::SortBy(key, cfg.sort_asc));
+            }
+        }
+        ui.separator();
+        if radio_item(ui, cfg.sort_asc, tr("Ascending")) {
+            out.actions.push(Action::SortBy(cfg.sort, true));
+        }
+        if radio_item(ui, !cfg.sort_asc, tr("Descending")) {
+            out.actions.push(Action::SortBy(cfg.sort, false));
+        }
+    });
     let mut hidden = cfg.show_hidden;
-    if ui.checkbox(&mut hidden, crate::i18n::tr("Show Hidden Files")).clicked() {
+    if ui.checkbox(&mut hidden, tr("Show Hidden Files")).clicked() {
         out.actions.push(Action::ToggleHidden);
         ui.close_menu();
     }
-    if mi(ui, crate::i18n::tr("Select All"), "Ctrl+A") {
+    ui.separator();
+    if mi(ui, tr("Open Terminal Here"), "F4") {
+        out.actions.push(Action::Terminal(cwd.to_path_buf()));
+    }
+    if mi(ui, tr("Open in New Window"), "") {
+        out.actions.push(Action::NewWindow(cwd.to_path_buf()));
+    }
+    if mi(ui, tr("Copy Location"), "") {
+        out.actions.push(Action::CopyPath);
+    }
+    if mi(ui, tr("Add to Places"), "") {
+        out.actions.push(Action::AddPlace(cwd.to_path_buf()));
+    }
+    ui.separator();
+    if mi(ui, tr("Select All"), "Ctrl+A") {
         out.actions.push(Action::SelectAll);
     }
-    if mi(ui, crate::i18n::tr("Refresh"), "F5") {
+    if mi(ui, tr("Refresh"), "F5") {
         out.actions.push(Action::Refresh);
+    }
+    if cfg!(windows) && mi(ui, tr("Properties"), "") {
+        out.actions.push(Action::Props(cwd.to_path_buf()));
     }
 }
 
+/// Everything the right-click menu of this item needs, read once.
+fn item_menu_for(pane: &Pane, path: &Path, is_dir: bool, can_paste: bool) -> ItemMenu {
+    let ext = if is_dir { String::new() } else { path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default() };
+    let count = pane.selected.len().max(1);
+    // Name a new archive would get: the item's own, or the folder's for several items.
+    let pack = if count > 1 {
+        pane.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| crate::i18n::tr("Archive").into())
+    } else if is_dir {
+        display_name(path)
+    } else {
+        path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+    #[cfg(windows)]
+    let (archive, pinned) = (
+        crate::archive::is_archive(path),
+        (!is_dir && ["exe", "lnk", "url", "appref-ms"].contains(&ext.as_str())).then(|| crate::shell::pins::is_pinned(path)),
+    );
+    #[cfg(not(windows))]
+    let (archive, pinned) = (false, None);
+    ItemMenu { path: path.to_path_buf(), is_dir, ext, pack, count, archive, pinned, can_paste }
+}
+
 /// Selection, opening and context menu for one item.
-fn handle_item(ui: &Ui, pane: &mut Pane, vi: usize, resp: &egui::Response, out: &mut PaneOut) {
+fn handle_item(ui: &Ui, pane: &mut Pane, vi: usize, resp: &egui::Response, can_paste: bool, out: &mut PaneOut) {
     let (path, is_dir) = {
         let e = pane.ent(vi);
         (e.path.clone(), e.is_dir)
@@ -2201,17 +2587,16 @@ fn handle_item(ui: &Ui, pane: &mut Pane, vi: usize, resp: &egui::Response, out: 
             pane.select_only(vi);
         }
         out.activated = true;
+        pane.menu = Some(item_menu_for(pane, &path, is_dir, can_paste));
     }
     resp.context_menu(|ui| {
-        // Name a new archive would get: the item's own, or the folder's for several items.
-        let pack = if pane.selected.len() > 1 {
-            pane.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| crate::i18n::tr("Archive").into())
-        } else if is_dir {
-            display_name(&path)
-        } else {
-            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
-        };
-        item_menu(ui, &path, is_dir, &pack, out)
+        // Normally worked out by the click above; this covers a menu opened some other way.
+        if pane.menu.as_ref().map_or(true, |m| m.path != path) {
+            pane.menu = Some(item_menu_for(pane, &path, is_dir, can_paste));
+        }
+        if let Some(m) = pane.menu.clone() {
+            item_menu(ui, &m, out);
+        }
     });
 }
 
@@ -2258,6 +2643,15 @@ fn pane_view(
                 return;
             }
             if pane.visible.is_empty() {
+                // A slow folder: say so, but not for the blink of an eye.
+                if let Some(since) = pane.loading {
+                    if since.elapsed() > Duration::from_millis(120) {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(RichText::new(crate::i18n::tr("Loading…")).color(pal.dim).size(16.0))
+                        });
+                    }
+                    return;
+                }
                 let msg = if pane.filter.is_empty() {
                     crate::i18n::tr("Folder is empty")
                 } else {
@@ -2269,9 +2663,9 @@ fn pane_view(
                 return;
             }
             match cfg.view {
-                ViewMode::Icons => grid_view(ui, pane, idx, cfg, pal, cut, &mut out, false),
-                ViewMode::Compact => grid_view(ui, pane, idx, cfg, pal, cut, &mut out, true),
-                ViewMode::Details => details_view(ui, pane, idx, cfg, pal, cut, &mut out),
+                ViewMode::Icons => grid_view(ui, pane, idx, cfg, pal, cut, can_paste, &mut out, false),
+                ViewMode::Compact => grid_view(ui, pane, idx, cfg, pal, cut, can_paste, &mut out, true),
+                ViewMode::Details => details_view(ui, pane, idx, cfg, pal, cut, can_paste, &mut out),
             }
         });
     out
@@ -2297,6 +2691,7 @@ fn grid_view(
     cfg: &Config,
     pal: &Palette,
     cut: &[PathBuf],
+    can_paste: bool,
     out: &mut PaneOut,
     compact: bool,
 ) {
@@ -2385,7 +2780,7 @@ fn grid_view(
                     }
                     let name = pane.ent(vi).name.clone();
                     let resp = resp.on_hover_text(name);
-                    handle_item(ui, pane, vi, &resp, out);
+                    handle_item(ui, pane, vi, &resp, can_paste, out);
                 }
             });
         }
@@ -2394,6 +2789,7 @@ fn grid_view(
     pane.viewport_h = o.inner_rect.height();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn details_view(
     ui: &mut Ui,
     pane: &mut Pane,
@@ -2401,6 +2797,7 @@ fn details_view(
     cfg: &Config,
     pal: &Palette,
     cut: &[PathBuf],
+    can_paste: bool,
     out: &mut PaneOut,
 ) {
     let w = ui.available_width() - 14.0;
@@ -2558,7 +2955,7 @@ fn details_view(
                     pal.dim,
                 );
             }
-            handle_item(ui, pane, vi, &resp, out);
+            handle_item(ui, pane, vi, &resp, can_paste, out);
         }
     });
     pane.scroll_offset = o.state.offset.y;
