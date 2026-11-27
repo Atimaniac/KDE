@@ -156,7 +156,9 @@ mod imp {
                 if !e.is_null() {
                     let p = GlobalLock(e) as *const u32;
                     if !p.is_null() {
-                        cut = p.read_unaligned() & 2 != 0;
+                        // Move only, not "copy or move" (7), which some programs write.
+                        let fx = p.read_unaligned();
+                        cut = fx & 2 != 0 && fx & 1 == 0;
                         GlobalUnlock(e);
                     }
                 }
