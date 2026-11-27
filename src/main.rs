@@ -17,6 +17,8 @@ mod icons;
 mod props;
 mod platform;
 #[cfg(windows)]
+mod recyclebin;
+#[cfg(windows)]
 mod renamebox;
 mod shellops;
 #[cfg(windows)]
@@ -66,6 +68,9 @@ fn main() -> Result<(), eframe::Error> {
             if let Some(p) = args.get(i + 1) {
                 return renamebox::run(std::path::PathBuf::from(p));
             }
+        }
+        if has("--recyclebin") {
+            return recyclebin::run();
         }
         if has("--devmgr") {
             return devmgr::run();

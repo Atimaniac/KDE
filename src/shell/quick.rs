@@ -620,7 +620,10 @@ impl QuickPanel {
     /// Change the volume by `delta` (0..1 scale), e.g. from the mouse wheel.
     pub fn nudge_volume(&self, delta: f32) {
         if let Some(v) = &self.vol {
-            v.set_level(v.level() + delta);
+            // On a grid of `delta` steps, like Windows (15 % → 17 %, not 15.9 % → 17.9 %).
+            let step = delta.abs().max(0.01);
+            let level = ((v.level() / step).round() + delta.signum()) * step;
+            v.set_level(level);
             if v.muted() && delta > 0.0 {
                 v.set_muted(false);
             }

@@ -582,6 +582,12 @@ impl ShellApp {
                 let c = c.clone();
                 self.open_uri(&c);
             }
+            // Delfin's own Recycle Bin window (Explorer's view needs Explorer).
+            Launch::Cmd(c) if c.eq_ignore_ascii_case("shell:RecycleBinFolder") => {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).arg("--recyclebin").spawn();
+                }
+            }
             Launch::Cmd(c) => {
                 let _ = win::run_cmdline(c);
             }
@@ -1176,7 +1182,10 @@ impl ShellApp {
                 );
 
                 ui.horizontal_centered(|ui| {
-                    if launcher_button(ui, self.launcher_open, pal).clicked() {
+                    // Opens on the press, not the release: the menu is there
+                    // a click's length sooner.
+                    let lb = launcher_button(ui, self.launcher_open, pal);
+                    if lb.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
                         actions.push(PanelAction::ToggleLauncher);
                     }
                     ui.add_space(4.0);
@@ -1909,6 +1918,46 @@ ui.ctx().request_repaint();
 
                         let power_top = right.bottom() - 54.0;
 
+                        // ---- bottom left: Recycle Bin, level with the power row
+                        {
+                            let r = Rect::from_min_size(pos2(left.left(), power_top + 4.0), vec2(left.width() - 8.0, 44.0));
+                            let resp = ui.interact(r, ui.id().with("recycle-bin"), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, 6.0, pal.hover);
+                            }
+                            ui.painter().line_segment([pos2(left.left(), power_top), pos2(left.right() - 8.0, power_top)], line);
+                            icons::paint_tool(
+                                ui.painter(),
+                                Rect::from_center_size(pos2(r.left() + 20.0, r.center().y), vec2(20.0, 20.0)),
+                                Tool::Trash,
+                                pal.text,
+                            );
+                            ui.painter().text(
+                                pos2(r.left() + 40.0, r.center().y),
+                                Align2::LEFT_CENTER,
+                                crate::i18n::tr("Recycle Bin"),
+                                FontId::proportional(14.0),
+                                pal.text,
+                            );
+                            if resp.clicked() {
+                                launch = Some((Launch::Cmd("shell:RecycleBinFolder".into()), None));
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button(crate::i18n::tr("Open")).clicked() {
+                                    launch = Some((Launch::Cmd("shell:RecycleBinFolder".into()), None));
+                                    ui.close_menu();
+                                }
+                                if ui.button(crate::i18n::tr("Empty Recycle Bin")).clicked() {
+                                    // Windows asks first; on its own thread, as the question waits.
+                                    std::thread::spawn(|| unsafe {
+                                        windows_sys::Win32::UI::Shell::SHEmptyRecycleBinW(std::ptr::null_mut(), std::ptr::null(), 0);
+                                    });
+                                    close = true;
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+
                         // ---- power row
                         ui.painter().line_segment([pos2(right.left(), power_top), pos2(right.right(), power_top)], line);
                         let armed = self
@@ -2596,6 +2645,9 @@ impl eframe::App for ShellApp {
                     win::MediaKey::Stop => media::Cmd::Stop,
                 }),
                 win::Hotkey::Volume(step) => {
+                    // The default device may have just changed (headphones,
+                    // a switch in Settings): always act on the current one.
+                    self.qp.refresh_volume();
                     if step == 0 {
                         self.qp.toggle_mute();
                     } else {

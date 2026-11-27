@@ -1839,8 +1839,7 @@ impl Settings {
         // Per-app volume (the volume mixer).
         section(ui, tr("Volume mixer"));
         let sessions = self.sessions.clone();
-        // Windows doesn't always let other programs change each app's volume;
-        // then its own mixer does it.
+        // No sessions read (there's always at least System sounds): Windows' own mixer.
         if sessions.is_empty() && ext_row(ui, lk, Ico::Sliders, tr("Volume mixer"), tr("App volume")) {
             sys::start("sndvol.exe");
         }

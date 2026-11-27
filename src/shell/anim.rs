@@ -87,6 +87,24 @@ struct Shot {
     h: i32,
 }
 
+impl Shot {
+    /// Nothing drawn yet: every sampled pixel has the same colour.
+    fn blank(&self) -> bool {
+        unsafe {
+            let first = GetPixel(self.dc, 0, 0);
+            let step = 7;
+            for y in (0..self.h).step_by((self.h / step).max(1) as usize) {
+                for x in (0..self.w).step_by((self.w / step).max(1) as usize) {
+                    if GetPixel(self.dc, x, y) != first {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+    }
+}
+
 impl Drop for Shot {
     fn drop(&mut self) {
         unsafe {
@@ -257,11 +275,20 @@ pub fn prepare_open(h: HWND) {
     let hw = h as isize;
     std::thread::spawn(move || unsafe {
         let h = hw as HWND;
-        // Let the window draw its first frames before taking its picture.
-        std::thread::sleep(Duration::from_millis(45));
+        // Take its picture as soon as it has drawn something (a frame takes
+        // ~8 ms); a fixed wait used to hold every pop-up back by 45 ms.
         let mut r: RECT = std::mem::zeroed();
-        GetWindowRect(h, &mut r);
-        if let Some(s) = shot(h) {
+        let mut pic = None;
+        let begin = Instant::now();
+        while begin.elapsed() < Duration::from_millis(50) {
+            std::thread::sleep(Duration::from_millis(10));
+            GetWindowRect(h, &mut r);
+            pic = shot(h);
+            if pic.as_ref().is_some_and(|s| !s.blank()) {
+                break;
+            }
+        }
+        if let Some(s) = pic {
             play(&s, r, e, true);
         }
         if IsWindow(h) != 0 {

@@ -15,7 +15,7 @@ const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63d
 const IID_POLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
 const IID_SESSION_MANAGER2: GUID = GUID::from_u128(0x77aa99a0_1bd6_484f_8bc7_2c654c9a9b6f);
 const IID_SESSION_CONTROL2: GUID = GUID::from_u128(0xbfb7ff88_7239_4fc9_8fa2_07c950be9c6d);
-const IID_SIMPLE_VOLUME: GUID = GUID::from_u128(0x87ce5498_68d6_44e5_9215_6f5a3bdd1b29);
+const IID_SIMPLE_VOLUME: GUID = GUID::from_u128(0x87ce5498_68d6_44e5_9215_6da47ef883d8);
 /// PKEY_Device_FriendlyName
 const FRIENDLY_NAME: (GUID, u32) = (GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0), 14);
 
@@ -310,3 +310,4 @@ pub fn set_session(pid: u32, system: bool, volume: Option<f32>, mute: Option<boo
         });
     }
 }
+

@@ -147,6 +147,21 @@ pub fn weekday_short(d: u32) -> &'static str {
 
 const PL: &[(&str, &str)] = &[
     // ---- file manager
+    ("Empty Recycle Bin", "Opróżnij kosz"),
+    ("Restore", "Przywróć"),
+    ("Delete permanently", "Usuń trwale"),
+    ("Original location", "Pierwotna lokalizacja"),
+    ("Date deleted", "Data usunięcia"),
+    ("{} selected", "Zaznaczono: {}"),
+    ("{} items · {}", "Elementy: {} · {}"),
+    ("Restored {} item(s)", "Przywrócono: {}"),
+    ("Deleted {} item(s) permanently", "Usunięto trwale: {}"),
+    ("Can't restore: {} already exists", "Nie można przywrócić: {} już istnieje"),
+    ("Can't restore: {}", "Nie można przywrócić: {}"),
+    ("Can't delete: {}", "Nie można usunąć: {}"),
+    ("Can't read the Recycle Bin: {}", "Nie można odczytać kosza: {}"),
+    ("Select items to restore them or delete them for good. Ctrl+A selects all.", "Zaznacz elementy, aby je przywrócić lub usunąć na zawsze. Ctrl+A zaznacza wszystko."),
+    ("Permanently delete {} item(s)? This can't be undone.", "Trwale usunąć elementy ({})? Tego nie da się cofnąć."),
     ("Extract Here", "Wypakuj tutaj"),
     ("Extract to \"{}\\\"", "Wypakuj do „{}\\”"),
     ("Open in 7-Zip", "Otwórz w 7-Zip"),
