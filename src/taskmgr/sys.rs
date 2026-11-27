@@ -243,6 +243,9 @@ impl Drop for Nvml {
 }
 
 /// The Performance page is showing: read the GPU temperature (loads NVML).
+/// How often the figures are read, in ms (0 = paused), like Windows' "Real-time update speed".
+pub static UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+
 pub static WANT_GPU_TEMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 unsafe impl Send for Nvml {}
@@ -702,7 +705,15 @@ fn sampler(ctx: eframe::egui::Context, out: Arc<Mutex<Snapshot>>) {
         *out.lock().unwrap_or_else(|p| p.into_inner()) = snap;
         ctx.request_repaint();
         first = false;
-        std::thread::sleep(Duration::from_millis(1000));
+        // Wait in short steps so a new update speed (or un-pausing) applies at once.
+        let waited = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let ms = UPDATE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if ms != 0 && waited.elapsed() >= Duration::from_millis(ms) {
+                break;
+            }
+        }
     }
 }
 

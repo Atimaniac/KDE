@@ -34,6 +34,8 @@ pub struct Config {
     /// Opening and closing effect of the shell's pop-ups (see shell::anim) and its speed (0 fast, 1 normal, 2 slow).
     pub win_fx: u8,
     pub win_fx_speed: u8,
+    /// Task Manager's update speed in ms (0 = paused).
+    pub tm_update_ms: u64,
 }
 
 impl Default for Config {
@@ -55,6 +57,7 @@ impl Default for Config {
             aero_strength: 45,
             win_fx: 3,
             win_fx_speed: 1,
+            tm_update_ms: 1000,
         }
     }
 }
@@ -112,6 +115,7 @@ impl Config {
                 }
                 "win_fx" => c.win_fx = v.parse().unwrap_or(3),
                 "win_fx_speed" => c.win_fx_speed = v.parse().unwrap_or(1),
+                "tm_update_ms" => c.tm_update_ms = v.parse().unwrap_or(1000),
                 "aero_strength" => {
                     if let Ok(x) = v.parse::<u8>() {
                         c.aero_strength = x.min(100);
@@ -156,6 +160,7 @@ impl Config {
         s += &format!("aero_color={:02x}{:02x}{:02x}\n", self.aero_color[0], self.aero_color[1], self.aero_color[2]);
         s += &format!("aero_strength={}\n", self.aero_strength);
         s += &format!("win_fx={}\nwin_fx_speed={}\n", self.win_fx, self.win_fx_speed);
+        s += &format!("tm_update_ms={}\n", self.tm_update_ms);
         for p in &self.places {
             s += &format!("place={}\n", p.display());
         }

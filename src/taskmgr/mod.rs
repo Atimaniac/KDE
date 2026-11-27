@@ -186,7 +186,9 @@ pub fn run() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| {
             theme::install_fonts(&cc.egui_ctx);
-            let dark = crate::config::Config::load().dark;
+            let cfg = crate::config::Config::load();
+            let dark = cfg.dark;
+            sys::UPDATE_MS.store(cfg.tm_update_ms, std::sync::atomic::Ordering::Relaxed);
             theme::apply(&cc.egui_ctx, dark);
             Ok(Box::new(TaskMgr {
                 pal: theme::palette(dark),
@@ -268,6 +270,11 @@ fn graph(p: &egui::Painter, r: Rect, hist: &[f32], max: f32, col: Color32, grid:
     p.add(Shape::line(pts, Stroke::new(1.5_f32, col)));
 }
 
+/// A percentage as the list shows it (one decimal), for sorting.
+fn shown(v: f32) -> i64 {
+    (v * 10.0).round() as i64
+}
+
 fn heat(pal: &Palette, f: f32) -> Color32 {
     // Darker = busier, like Windows.
     pal.accent.gamma_multiply(0.08 + 0.42 * f.clamp(0.0, 1.0))
@@ -335,22 +342,23 @@ impl TaskMgr {
         }
         let mut v: Vec<Group> = map.into_values().collect();
         let (col, desc) = self.sort;
-        v.sort_by(|a, b| {
-            let o = match col {
-                Col::Name | Col::Pid => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                Col::Cpu => a.cpu.partial_cmp(&b.cpu).unwrap_or(std::cmp::Ordering::Equal),
-                Col::Mem => a.mem.cmp(&b.mem),
-                Col::Disk => a.io.partial_cmp(&b.io).unwrap_or(std::cmp::Ordering::Equal),
-                Col::Gpu => a.gpu.partial_cmp(&b.gpu).unwrap_or(std::cmp::Ordering::Equal),
+        // The map hands groups out in a different order every time, so equal
+        // values (most processes sit at 0% CPU) need a fixed order too, or the
+        // list reshuffles on every redraw. Values compare as they are shown.
+        let name = |g: &Group| (g.name.to_lowercase(), g.key.clone());
+        v.sort_by_cached_key(|g| {
+            let k = match col {
+                Col::Name | Col::Pid => 0,
+                Col::Cpu => shown(g.cpu),
+                Col::Mem => (g.mem / (100 * 1024)) as i64,
+                Col::Disk => (g.io / 100_000.0).round() as i64,
+                Col::Gpu => shown(g.gpu),
             };
-            if desc && col != Col::Name {
-                o.reverse()
-            } else if desc {
-                o.reverse()
-            } else {
-                o
-            }
+            (if desc && col != Col::Name { -k } else { k }, name(g))
         });
+        if desc && matches!(col, Col::Name | Col::Pid) {
+            v.reverse();
+        }
         v
     }
 
@@ -482,6 +490,9 @@ impl eframe::App for TaskMgr {
                         .size(12.0)
                         .color(pal.dim),
                     );
+                    if sys::UPDATE_MS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                        ui.label(RichText::new(format!("   {}", tr("Updates paused"))).size(12.0).color(pal.accent));
+                    }
                     if let Some((m, t)) = &self.message {
                         if t.elapsed() < Duration::from_secs(8) {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1090,21 +1101,22 @@ impl TaskMgr {
             .filter(|p| q.is_empty() || p.exe.to_lowercase().contains(&q) || p.desc.to_lowercase().contains(&q) || p.pid.to_string() == q)
             .collect();
         let (col, desc) = self.sort;
-        procs.sort_by(|a, b| {
-            let o = match col {
-                Col::Name => a.exe.to_lowercase().cmp(&b.exe.to_lowercase()),
-                Col::Pid => a.pid.cmp(&b.pid),
-                Col::Cpu => a.cpu.partial_cmp(&b.cpu).unwrap_or(std::cmp::Ordering::Equal),
-                Col::Mem => a.mem.cmp(&b.mem),
-                Col::Disk => a.io.partial_cmp(&b.io).unwrap_or(std::cmp::Ordering::Equal),
-                Col::Gpu => a.gpu.partial_cmp(&b.gpu).unwrap_or(std::cmp::Ordering::Equal),
+        // Ties broken by name and PID so equal rows keep their places.
+        procs.sort_by_cached_key(|p| {
+            let k = match col {
+                Col::Name => 0,
+                Col::Pid => p.pid as i64,
+                Col::Cpu => shown(p.cpu),
+                Col::Mem => (p.mem / (100 * 1024)) as i64,
+                Col::Disk => (p.io / 100_000.0).round() as i64,
+                Col::Gpu => shown(p.gpu),
             };
-            if desc {
-                o.reverse()
-            } else {
-                o
-            }
+            let k = if desc && col != Col::Name { -k } else { k };
+            (k, p.exe.to_lowercase(), p.pid)
         });
+        if desc && col == Col::Name {
+            procs.reverse();
+        }
         let w = ui.available_width();
         let cols = [
             (Col::Name, tr("Name"), 220.0),
@@ -1334,6 +1346,20 @@ impl TaskMgr {
             } else {
                 egui::WindowLevel::Normal
             }));
+        }
+        ui.add_space(16.0);
+        ui.label(RichText::new(tr("Real-time update speed")).size(16.0));
+        ui.label(RichText::new(tr("How often the processes and graphs are refreshed.")).color(pal.dim));
+        ui.add_space(4.0);
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = sys::UPDATE_MS.load(Relaxed);
+        for (ms, label) in [(500, tr("High (every half second)")), (1000, tr("Normal (every second)")), (4000, tr("Low (every 4 seconds)")), (0, tr("Paused (no updates)"))] {
+            if ui.radio(now == ms, label).clicked() && now != ms {
+                sys::UPDATE_MS.store(ms, Relaxed);
+                let mut cfg = crate::config::Config::load();
+                cfg.tm_update_ms = ms;
+                cfg.save();
+            }
         }
         ui.add_space(16.0);
         ui.label(RichText::new(trf("Delfin {}", &[&crate::update::CURRENT])).color(pal.dim));
